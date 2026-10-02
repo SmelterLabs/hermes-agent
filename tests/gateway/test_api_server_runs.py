@@ -110,6 +110,16 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     return app
 
 
+def _create_openai_app(adapter: APIServerAdapter) -> web.Application:
+    """Create an aiohttp app with the ordinary OpenAI-compatible routes."""
+    mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
+    app = web.Application(middlewares=mws)
+    app["api_server_adapter"] = adapter
+    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+    app.router.add_post("/v1/responses", adapter._handle_responses)
+    return app
+
+
 def _make_slow_agent(**kwargs):
     """Create a mock agent that blocks in run_conversation until interrupted.
 
@@ -911,14 +921,14 @@ class TestRunEvents:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{attacker_run}/approval",
-                    json={"choice": "always", "resolve_all": True},
+                    json={"choice": "once", "resolve_all": True},
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 approval_data = await approval_resp.json()
 
                 assert approval_resp.status == 200
                 assert approval_data["resolved"] == 1
-                assert attacker_entry.result == "always"
+                assert attacker_entry.result == "once"
                 assert attacker_entry.event.is_set()
                 assert victim_entry.result is None
                 assert not victim_entry.event.is_set()
@@ -933,6 +943,419 @@ class TestRunEvents:
                     approval_mod._gateway_queues.pop(victim_run, None)
                 victim_interrupted.set()
                 attacker_interrupted.set()
+
+
+class TestApiServerRunApproval:
+    """Exercise the real /v1/runs approval bridge and its run-key isolation."""
+
+    @staticmethod
+    async def _wait_for_status(cli, run_id, expected):
+        latest = None
+        for _ in range(100):
+            response = await cli.get(f"/v1/runs/{run_id}")
+            latest = await response.json()
+            if latest.get("status") == expected:
+                return latest
+            await asyncio.sleep(0.05)
+        raise AssertionError(f"run {run_id} did not reach {expected}: {latest!r}")
+
+    @staticmethod
+    def _gate_agent(gate, decisions):
+        agent = MagicMock()
+
+        def run(**_kwargs):
+            if gate == "terminal":
+                decision = approval_mod.check_all_command_guards("rm -rf /tmp/api-run", "local")
+            else:
+                decision = approval_mod.check_execute_code_guard("import os", "local")
+            decisions.append(decision)
+            return {"final_response": "done"}
+
+        agent.run_conversation.side_effect = run
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+        return agent
+
+    @staticmethod
+    def _protected_gate_agent(decisions):
+        from tools import file_tools_write_guards as guards
+
+        agent = MagicMock()
+
+        def run(**kwargs):
+            decisions.append(
+                guards._check_protected_instruction_write(["AGENTS.md"], kwargs.get("task_id", "default"))
+            )
+            return {"final_response": "done"}
+
+        agent.run_conversation.side_effect = run
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+        agent.session_id = None
+        return agent
+
+    @staticmethod
+    def _consent_agent(entrypoint, decisions):
+        from tools import browser_vault_tool
+        from tools.approval_prompt import request_elicitation_consent
+
+        agent = MagicMock()
+
+        def run(**_kwargs):
+            if entrypoint == "mcp":
+                decision = request_elicitation_consent(
+                    "approve MCP", "untrusted MCP server", surface="mcp-elicitation/test")
+            else:
+                decision = browser_vault_tool._confirm_payment_fill("Visa", "https://shop.test")
+            decisions.append(decision)
+            return {"final_response": "done"}
+
+        agent.run_conversation.side_effect = run
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+        agent.session_id = None
+        return agent
+
+    @pytest.mark.asyncio
+    async def test_ordinary_chat_api_cannot_borrow_run_protected_listener(self, auth_adapter):
+        """A real ordinary API turn cannot consume a colliding /v1/runs listener."""
+        from tools import file_tools_write_guards as guards
+        from tools.approval import (
+            issue_api_run_approval_lease, register_gateway_notify, unregister_gateway_notify,
+        )
+
+        app = _create_openai_app(auth_adapter)
+        run_key = "run_ordinary-protected-collision"
+        capability = issue_api_run_approval_lease(run_key, owner=object())
+        callback_calls = []
+
+        def notify(data):
+            callback_calls.append(dict(data))
+            # A regression that borrows this listener would otherwise block the
+            # test; resolve the borrowed request and make the unsafe allow visible.
+            approval_mod.resolve_gateway_approval(
+                run_key, "once", request_id=data.get("request_id"))
+
+        register_gateway_notify(run_key, notify, capability=capability)
+        decisions = []
+        agent = self._protected_gate_agent(decisions)
+        with (
+            patch.object(guards, "_protected_instruction_config", return_value=(True, [])),
+            patch.object(auth_adapter, "_create_agent", return_value=agent),
+        ):
+            try:
+                async with TestClient(TestServer(app)) as cli:
+                    response = await cli.post(
+                        "/v1/chat/completions",
+                        json={
+                            "model": "test-model",
+                            "messages": [{"role": "user", "content": "protected write"}],
+                        },
+                        headers={
+                            "Authorization": "Bearer sk-secret",
+                            "X-Hermes-Session-Id": run_key,
+                        },
+                    )
+                    body = await response.json()
+            finally:
+                unregister_gateway_notify(run_key, capability=capability)
+
+        assert response.status == 200
+        assert len(decisions) == 1
+        assert decisions[0] is not None
+        assert "no live approval listener" in decisions[0]
+        assert callback_calls == []
+        with approval_mod._lock:
+            assert run_key not in approval_mod._gateway_queues
+            assert run_key not in approval_mod._gateway_notify_cbs
+        assert body["choices"][0]["message"]["content"]
+
+    def test_cancelled_launch_cannot_register_a_late_api_listener(self, adapter):
+        """Outer task cleanup winning first must not let the executor register afterward."""
+        from contextlib import nullcontext
+        from gateway.platforms import api_server as api_server_mod
+        from gateway.platforms.api_server_runs import _RunLaunch, _run_agent_sync
+
+        run = _RunLaunch(
+            adapter, "cancelled-before-register", asyncio.Queue(), "cancelled-before-register", None,
+            False, "", [], False,
+            {"room_dispatch": None, "room_execution_policy": None}, None, None, None,
+        )
+        run.approval_cancelled = True
+        agent = MagicMock()
+        notify = MagicMock()
+        with (
+            patch.object(adapter, "_profile_scope", return_value=nullcontext()),
+            patch.object(adapter, "_bind_api_server_session", return_value=()),
+            patch("tools.approval.register_gateway_notify") as register,
+            patch("tools.approval.unregister_gateway_notify") as unregister,
+            patch.object(api_server_mod, "_clear_turn_process_ownership"),
+        ):
+            result, usage = _run_agent_sync(
+                adapter, run, agent, notify, _api_server=api_server_mod)
+
+        assert result == {"interrupted": True}
+        assert usage == {}
+        register.assert_not_called()
+        unregister.assert_called_once_with("cancelled-before-register", capability=run.approval_capability)
+        agent.run_conversation.assert_not_called()
+
+    def test_http_route_table_exposes_run_approval_path(self, adapter):
+        routes = {(method, path) for method, path, _handler in adapter._http_route_table()}
+        assert ("POST", "/v1/runs") in routes
+        assert ("POST", "/v1/runs/{run_id}/approval") in routes
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("gate", ["terminal", "execute_code"])
+    @pytest.mark.parametrize("choice", ["once", "deny"])
+    async def test_http_run_approval_reaches_listener_backed_gate(
+        self, adapter, gate, choice
+    ):
+        app = _create_runs_app(adapter)
+        decisions = []
+        agent = self._gate_agent(gate, decisions)
+        run_id = None
+        with (
+            patch.object(approval_mod, "_permanent_approved", set()),
+            patch("tools.approval_context._get_approval_mode", return_value="manual"),
+            patch.object(adapter, "_create_agent", return_value=agent),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                try:
+                    started = await cli.post("/v1/runs", json={"input": "run approval"})
+                    assert started.status == 202
+                    run_id = (await started.json())["run_id"]
+
+                    waiting = await self._wait_for_status(cli, run_id, "waiting_for_approval")
+                    approval = waiting["approval"]
+                    request_id = approval["request_id"]
+                    assert approval["event"] == "approval.request"
+                    with approval_mod._lock:
+                        assert approval_mod._gateway_notify_cbs.get(run_id) is not None
+
+                    wrong = await cli.post(
+                        f"/v1/runs/{run_id}/approval",
+                        json={"choice": choice, "request_id": "wrong-request"},
+                    )
+                    wrong_body = await wrong.json()
+                    assert wrong.status == 409
+                    assert wrong_body["error"]["code"] == "approval_not_pending"
+
+                    response = await cli.post(
+                        f"/v1/runs/{run_id}/approval",
+                        json={"choice": choice, "request_id": request_id},
+                    )
+                    body = await response.json()
+                    assert response.status == 200
+                    assert body["resolved"] == 1
+                    assert body["request_id"] == request_id
+
+                    await self._wait_for_status(cli, run_id, "completed")
+                    assert len(decisions) == 1
+                    if choice == "once":
+                        assert decisions[0]["approved"] is True
+                    else:
+                        assert decisions[0]["approved"] is False
+                        assert decisions[0]["outcome"] == "denied"
+                    with approval_mod._lock:
+                        assert run_id not in approval_mod._gateway_queues
+                        assert run_id not in approval_mod._gateway_notify_cbs
+                finally:
+                    if run_id:
+                        approval_mod.resolve_gateway_approval(run_id, "deny", resolve_all=True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entrypoint", ["mcp", "browser"])
+    @pytest.mark.parametrize("choice", ["once", "deny"])
+    async def test_http_run_approval_reaches_mcp_and_browser_consent(
+        self, adapter, entrypoint, choice
+    ):
+        """The real /v1/runs listener carries MCP/browser consent and exact responses."""
+        app = _create_runs_app(adapter)
+        decisions = []
+        agent = self._consent_agent(entrypoint, decisions)
+        run_id = None
+        with (
+            patch.object(approval_mod, "_permanent_approved", set()),
+            patch("tools.approval_context._get_approval_mode", return_value="manual"),
+            patch.object(adapter, "_create_agent", return_value=agent),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                try:
+                    started = await cli.post("/v1/runs", json={"input": f"{entrypoint} consent"})
+                    assert started.status == 202
+                    run_id = (await started.json())["run_id"]
+                    waiting = await self._wait_for_status(cli, run_id, "waiting_for_approval")
+                    approval = waiting["approval"]
+                    assert approval["event"] == "approval.request"
+                    assert approval["choices"] == ["once", "deny"]
+                    assert approval["allow_session"] is False
+                    assert approval["allow_permanent"] is False
+                    request_id = approval["request_id"]
+                    response = await cli.post(
+                        f"/v1/runs/{run_id}/approval",
+                        json={"choice": choice, "request_id": request_id},
+                    )
+                    assert response.status == 200
+                    assert (await response.json())["request_id"] == request_id
+                    await self._wait_for_status(cli, run_id, "completed")
+                finally:
+                    if run_id:
+                        approval_mod.resolve_gateway_approval(run_id, "deny", resolve_all=True)
+
+        assert decisions == (["accept"] if entrypoint == "mcp" and choice == "once" else
+                             ["decline"] if entrypoint == "mcp" else
+                             [True] if choice == "once" else [False])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("choice", ["once", "deny"])
+    async def test_http_run_approval_exact_protected_file_once_or_deny(self, adapter, choice):
+        """The exact /v1/runs approval response controls a protected AGENTS.md write."""
+        from tools import file_tools_write_guards as guards
+
+        app = _create_runs_app(adapter)
+        decisions = []
+        agent = self._protected_gate_agent(decisions)
+        run_id = None
+        with (
+            patch.object(approval_mod, "_permanent_approved", set()),
+            patch("tools.approval_context._get_approval_mode", return_value="manual"),
+            patch.object(guards, "_protected_instruction_config", return_value=(True, [])),
+            patch.object(adapter, "_create_agent", return_value=agent),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                try:
+                    started = await cli.post("/v1/runs", json={"input": "protected run"})
+                    assert started.status == 202
+                    run_id = (await started.json())["run_id"]
+                    waiting = await self._wait_for_status(cli, run_id, "waiting_for_approval")
+                    approval = waiting["approval"]
+                    assert approval["choices"] == ["once", "deny"]
+                    request_id = approval["request_id"]
+                    response = await cli.post(
+                        f"/v1/runs/{run_id}/approval",
+                        json={"choice": choice, "request_id": request_id},
+                    )
+                    body = await response.json()
+                    assert response.status == 200
+                    assert body["resolved"] == 1
+                    assert body["request_id"] == request_id
+                    await self._wait_for_status(cli, run_id, "completed")
+                finally:
+                    if run_id:
+                        approval_mod.resolve_gateway_approval(run_id, "deny", resolve_all=True)
+
+        assert len(decisions) == 1
+        if choice == "once":
+            assert decisions[0] is None
+        else:
+            assert "was denied by the user" in decisions[0]
+        with approval_mod._lock:
+            assert run_id not in approval_mod._gateway_queues
+            assert run_id not in approval_mod._gateway_notify_cbs
+            assert "protected_instruction_file" not in approval_mod._permanent_approved
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("gate", ["terminal", "execute_code"])
+    async def test_http_run_approval_timeout_releases_listener_state(self, adapter, gate):
+        app = _create_runs_app(adapter)
+        decisions = []
+        agent = self._gate_agent(gate, decisions)
+        run_id = None
+        with (
+            patch.object(approval_mod, "_permanent_approved", set()),
+            patch("tools.approval_context._get_approval_mode", return_value="manual"),
+            patch(
+                "tools.approval_context._get_approval_config",
+                return_value={"mode": "manual", "timeout": 0},
+            ),
+            patch.object(adapter, "_create_agent", return_value=agent),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                started = await cli.post("/v1/runs", json={"input": "timeout approval"})
+                assert started.status == 202
+                run_id = (await started.json())["run_id"]
+                final = await self._wait_for_status(cli, run_id, "completed")
+
+        assert len(decisions) == 1
+        assert decisions[0]["approved"] is False
+        assert decisions[0]["outcome"] == "timeout"
+        assert final["status"] == "completed"
+        with approval_mod._lock:
+            assert run_id not in approval_mod._gateway_queues
+            assert run_id not in approval_mod._gateway_notify_cbs
+
+    @pytest.mark.asyncio
+    async def test_http_run_approval_isolated_by_run_and_request_id(self, adapter):
+        app = _create_runs_app(adapter)
+        victim_decisions = []
+        attacker_decisions = []
+        victim_agent = self._gate_agent("terminal", victim_decisions)
+        attacker_agent = self._gate_agent("execute_code", attacker_decisions)
+        run_ids = []
+        with (
+            patch.object(approval_mod, "_permanent_approved", set()),
+            patch("tools.approval_context._get_approval_mode", return_value="manual"),
+            patch.object(adapter, "_create_agent", side_effect=[victim_agent, attacker_agent]),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                try:
+                    victim_response = await cli.post(
+                        "/v1/runs", json={"input": "victim", "session_id": "shared"}
+                    )
+                    attacker_response = await cli.post(
+                        "/v1/runs", json={"input": "attacker", "session_id": "shared"}
+                    )
+                    assert victim_response.status == attacker_response.status == 202
+                    victim_run = (await victim_response.json())["run_id"]
+                    attacker_run = (await attacker_response.json())["run_id"]
+                    run_ids.extend((victim_run, attacker_run))
+                    victim_waiting = await self._wait_for_status(cli, victim_run, "waiting_for_approval")
+                    attacker_waiting = await self._wait_for_status(cli, attacker_run, "waiting_for_approval")
+                    victim_request = victim_waiting["approval"]["request_id"]
+                    attacker_request = attacker_waiting["approval"]["request_id"]
+                    assert victim_run != attacker_run
+                    assert victim_request != attacker_request
+                    with approval_mod._lock:
+                        assert approval_mod._gateway_notify_cbs.get(victim_run) is not None
+                        assert approval_mod._gateway_notify_cbs.get(attacker_run) is not None
+
+                    wrong = await cli.post(
+                        f"/v1/runs/{victim_run}/approval",
+                        json={"choice": "once", "request_id": attacker_request},
+                    )
+                    wrong_body = await wrong.json()
+                    assert wrong.status == 409
+                    assert wrong_body["error"]["code"] == "approval_not_pending"
+                    assert (
+                        await (await cli.get(f"/v1/runs/{victim_run}")).json()
+                    )["status"] == "waiting_for_approval"
+
+                    attacker_resolved = await cli.post(
+                        f"/v1/runs/{attacker_run}/approval",
+                        json={"choice": "deny", "request_id": attacker_request},
+                    )
+                    assert attacker_resolved.status == 200
+                    assert (await attacker_resolved.json())["resolved"] == 1
+                    await self._wait_for_status(cli, attacker_run, "completed")
+                    assert len(attacker_decisions) == 1
+                    assert attacker_decisions[0]["approved"] is False
+
+                    victim_resolved = await cli.post(
+                        f"/v1/runs/{victim_run}/approval",
+                        json={"choice": "once", "request_id": victim_request},
+                    )
+                    assert victim_resolved.status == 200
+                    assert (await victim_resolved.json())["resolved"] == 1
+                    await self._wait_for_status(cli, victim_run, "completed")
+                    assert len(victim_decisions) == 1
+                    assert victim_decisions[0]["approved"] is True
+                finally:
+                    for run_id in run_ids:
+                        approval_mod.resolve_gateway_approval(run_id, "deny", resolve_all=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1190,8 +1613,10 @@ class TestSteerRun:
 class TestRunLifecycleSweep:
 
     @pytest.mark.asyncio
-    async def test_expired_live_run_drops_transport_but_keeps_control_state(self, adapter):
-        """Stream TTL bounds buffering without detaching a live run."""
+    async def test_expired_live_run_keeps_transport_and_control_state(self, adapter):
+        """A live run keeps its replayable transport past the stream TTL (the log is bounded by
+        count, not age) so a client can reattach however long the phone stayed locked; control
+        state is untouched either way."""
         app = _create_runs_app(adapter)
         adapter._max_concurrent_runs = 1
 
@@ -1228,8 +1653,8 @@ class TestRunLifecycleSweep:
 
                 assert adapter._active_run_tasks[run_id] is task
                 assert adapter._active_run_agents[run_id] is mock_agent
-                assert run_id not in adapter._run_streams
-                assert run_id not in adapter._run_streams_created
+                assert run_id in adapter._run_streams
+                assert run_id in adapter._run_streams_created
                 assert adapter._run_approval_sessions[run_id] == run_id
 
                 limited = adapter._concurrency_limited_response()
@@ -1247,6 +1672,46 @@ class TestRunLifecycleSweep:
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
                 assert stop_resp.status == 200
                 mock_agent.interrupt.assert_called_once_with("Stop requested via API")
+
+    def test_orphan_sweep_revokes_owned_listener_before_retiring_run(self, adapter):
+        """Expired transport cleanup cannot leave an ownerless approval listener."""
+        from gateway.platforms.api_server_runs import _sweep_orphaned_runs_once
+        from tools.approval import (
+            issue_api_run_approval_lease, register_gateway_notify,
+        )
+
+        run_id = "orphan-owned-approval"
+        lease = issue_api_run_approval_lease(run_id, owner=object())
+        assert lease is not None
+        adapter._run_streams[run_id] = _RunStream()
+        adapter._run_streams_created[run_id] = time.time() - adapter._RUN_STREAM_TTL - 1
+        adapter._run_approval_sessions[run_id] = run_id
+        adapter._run_approval_leases[run_id] = lease
+        adapter._active_run_tasks[run_id] = MagicMock(done=lambda: True)
+        adapter._active_run_agents[run_id] = MagicMock()
+        callback = MagicMock()
+        assert register_gateway_notify(run_id, callback, capability=lease)
+        pending = approval_gateway_wait._ApprovalEntry({
+            "command": "rm -rf /tmp/orphan",
+            "description": "orphan approval",
+            "pattern_keys": ["shell-c"],
+        })
+        with approval_mod._lock:
+            approval_mod._gateway_queues[run_id] = [pending]
+
+        _sweep_orphaned_runs_once(adapter, now=time.time())
+
+        assert pending.cancelled is True
+        assert pending.event.is_set()
+        with approval_mod._lock:
+            assert run_id not in approval_mod._gateway_notify_cbs
+            assert run_id not in approval_mod._gateway_notify_capabilities
+            assert run_id not in approval_mod._api_run_approval_leases
+            assert run_id not in approval_mod._gateway_queues
+        assert run_id not in adapter._run_approval_sessions
+        assert run_id not in adapter._run_approval_leases
+        assert run_id not in adapter._active_run_tasks
+        assert run_id not in adapter._active_run_agents
 
 
 # ---------------------------------------------------------------------------

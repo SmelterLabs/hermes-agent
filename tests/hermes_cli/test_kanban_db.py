@@ -1586,10 +1586,12 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
-    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    from hermes_cli._launchers import runtime_command
+    assert kbd._resolve_hermes_argv() == runtime_command(Path(kbd.__file__).resolve().parents[1])
 
-    monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
-    assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
+    override = str(Path("/opt/hermes/bin/hermes").resolve())
+    monkeypatch.setenv("HERMES_BIN", override)
+    assert kbd._resolve_hermes_argv() == [override]
 
 
 

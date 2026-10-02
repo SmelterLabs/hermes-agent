@@ -29,7 +29,8 @@ import {
   applyBargeInThresholdFromConfig,
   applyThinkingSoundFromConfig,
   applyVoiceSilenceMsFromConfig,
-  applyVoiceStopPhraseFromConfig
+  applyVoiceStopPhraseFromConfig,
+  applyVoiceTuningFromConfig
 } from '@/store/voice-prefs'
 import { setChatFontFamilyFromConfig } from '@/themes/chat-font'
 
@@ -174,6 +175,7 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
         applyVoiceSilenceMsFromConfig(config, defaults)
         // Resolved server-side (mode + whether a key resolves); non-critical.
         void refreshVoiceLiveStatus().catch(() => undefined)
+        applyVoiceTuningFromConfig(config)
       } catch {
         // Config is nice-to-have; chat still works without it.
       }

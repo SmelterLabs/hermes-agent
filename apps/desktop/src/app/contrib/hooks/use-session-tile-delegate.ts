@@ -1,5 +1,8 @@
 import { useEffect } from 'react'
 
+// From the leaf module, NOT the '@/hermes' barrel — test factories mocking
+// the barrel would each need the new export; nothing mocks the leaf.
+import { SESSION_RESUME_REQUEST_TIMEOUT_MS } from '@/api/client'
 import {
   extendRefreshPageToOverlap,
   graftRefreshedTailOntoBackfill,
@@ -436,7 +439,10 @@ export function useSessionTileDelegate({
                   cols: 96,
                   omit_messages: !authoritativeSnapshot,
                   ...(owner ? { profile: typeof owner === 'string' ? owner : owner.profile } : {})
-                }),
+                },
+                // A cold session's agent build takes 30s-minutes server-side;
+                // the generic 30s ack budget made every first open fail.
+                SESSION_RESUME_REQUEST_TIMEOUT_MS),
               { requiresMessages: authoritativeSnapshot, scope: owner }
             )
           },

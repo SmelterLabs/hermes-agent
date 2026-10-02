@@ -12,6 +12,7 @@ export {
   profileScopeKey,
   PROMPT_SUBMIT_REQUEST_TIMEOUT_MS,
   resolveOwnerNow,
+  SESSION_RESUME_REQUEST_TIMEOUT_MS,
   setApiRequestConnection,
   setApiRequestProfile,
   STARTUP_REQUEST_TIMEOUT_MS

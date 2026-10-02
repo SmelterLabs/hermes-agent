@@ -13,11 +13,13 @@ export function ProfileGlyph({
   color,
   isDefault,
   name,
+  softPercent = 22,
   ...props
 }: Omit<React.ComponentProps<'span'>, 'color'> & {
   color: null | string
   isDefault: boolean
   name: string
+  softPercent?: number
 }) {
   if (isDefault) {
     return (
@@ -35,7 +37,10 @@ export function ProfileGlyph({
         'grid size-4 shrink-0 place-items-center rounded-[3px] text-[0.5rem] font-semibold uppercase leading-none',
         className
       )}
-      style={{ backgroundColor: profileColorSoft(color ?? 'var(--ui-text-quaternary)', 22), color: color ?? undefined }}
+      style={{
+        backgroundColor: profileColorSoft(color ?? 'var(--ui-text-quaternary)', softPercent),
+        color: color ?? undefined
+      }}
       {...props}
     >
       {initial}

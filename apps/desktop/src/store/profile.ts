@@ -76,6 +76,11 @@ function profileListSource(connection: HermesConnection | null): null | string {
   return connection.connectionId ?? `${connection.mode ?? 'local'}:${connection.baseUrl}`
 }
 
+// Source that produced $profiles. Profile names are only unique inside one
+// connection, so consumers must not paint this cache after the active source
+// changes and before its replacement roster arrives.
+export const $profilesConnectionId = atom<null | string>(null)
+
 export function setActiveProfile(name: string): void {
   $activeProfile.set(name || 'default')
 }
@@ -114,19 +119,21 @@ export function refreshProfiles(): Promise<ProfileInfo[]> {
   const flight = (async () => {
     const epoch = profileListEpoch
     const source = profileListSource($connection.get())
+    const connectionId = activeGatewayConnectionId()
     const MAX_RETRIES = 2
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
         const { profiles } = await getProfiles()
 
-        if (epoch === profileListEpoch) {
+        if (epoch === profileListEpoch && connectionId === activeGatewayConnectionId()) {
           batch(() => {
             if (source !== null) {
               $profilesByConnection.set(new Map($profilesByConnection.get()).set(source, profiles))
             }
 
             $profiles.set(profiles)
+            $profilesConnectionId.set(connectionId)
           })
         }
 
@@ -188,7 +195,12 @@ $connection.subscribe(connection => {
   }
 
   invalidateProfileListFetches()
-  $profiles.set($profilesByConnection.get().get(source) ?? NO_PROFILES)
+  batch(() => {
+    $profiles.set($profilesByConnection.get().get(source) ?? NO_PROFILES)
+    // The repainted list belongs to the incoming source (PC overlay: keeps
+    // the profile-tag / switcher ownership guard in step with the cache).
+    $profilesConnectionId.set(connection?.connectionId ?? null)
+  })
 })
 
 // ── Rail order ─────────────────────────────────────────────────────────────
@@ -526,6 +538,15 @@ export function prewarmProfileBackend(name: string, connectionId: null | string 
   // box, so a hover sweep across the roster spawned one isolated backend per
   // bot and knocked the primary chat over. Only an explicit open may dial SSH.
   if (connection && registryConnectionKind(connection) === 'ssh') {
+    return
+  }
+
+  // openGatewayForProfile is the legacy LOCAL-scoped path. When the active
+  // source is a non-local registry connection the rail lists THAT machine's
+  // profiles; pre-warming them unscoped would spawn (and fail) local children
+  // for profile names that only exist remotely. An explicit `connection` dials
+  // through openGatewayForAgent and is unaffected.
+  if (!connection && activeGatewayConnectionId()) {
     return
   }
 

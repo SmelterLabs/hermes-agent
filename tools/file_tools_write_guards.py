@@ -280,36 +280,38 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
 
     try:
         import tools.approval as _approval
-        from tools.approval_context import _fire_approval_hook, get_current_session_key
+        from tools.approval_context import (
+            _fire_approval_hook,
+            _get_session_platform,
+            _is_unattended_platform_approval_context,
+            get_current_api_server_run_lease,
+            get_current_session_key,
+        )
         from tools.approval_gateway_wait import _await_gateway_decision
         from tools.approval_prompt import prompt_dangerous_approval
     except Exception:
         return blocked.format(why=_APPROVAL_UNAVAILABLE)
 
-    # Gateway surface: block on the button round-trip when a notify callback
-    # is registered for this session. One-operation only — no scope buttons.
+    # API-run approval is execution-owned, not session-key-owned. The public helper
+    # reads the callback and opaque capability together under the approval lock; the
+    # wait helper revalidates that exact pair before queueing and dispatching.
     session_key = get_current_session_key()
+    session_platform = _get_session_platform()
     try:
-        with _approval._lock:
-            notify_cb = _approval._gateway_notify_cbs.get(session_key)
+        listener = _approval.get_current_gateway_approval_listener()
     except Exception:
-        notify_cb = None
-
-    if notify_cb is not None:
-        approval_data = {
-            "command": display,
-            "pattern_key": "protected_instruction_file",
-            "pattern_keys": ["protected_instruction_file"],
-            "description": description,
-            "allow_permanent": False,
-            "allow_session": False}
-        decision = _await_gateway_decision(session_key, notify_cb, approval_data, surface="gateway")
-        if decision.get("notify_failed"):
-            return blocked.format(why="requires approval but the approval request could not be delivered.")
-        if decision.get("cancelled"):
-            return blocked.format(why=f"approval was withdrawn before the user answered ({decision['cancelled']}).")
-        choice, timed = decision.get("choice"), not decision.get("resolved")
-    else:
+        # A broken registry lookup is not a reason to bypass a protected write.
+        listener = None
+    current_lease = get_current_api_server_run_lease()
+    if listener is None:
+        if session_platform == "api_server" or current_lease is not None:
+            return blocked.format(
+                why="requires approval but this API execution has no live approval listener.")
+        if _is_unattended_platform_approval_context():
+            # Webhook and msgraph_webhook have no approval-response surface. Do not let
+            # a leaked CLI callback or process flag turn their protected-file write into
+            # an interactive fallback or an unanswerable pending request.
+            return blocked.format(why=_NO_HUMAN)
         # CLI surface: per-thread approval callback (prompt_toolkit panel).
         try:
             from tools.terminal_tool import _get_approval_callback
@@ -337,6 +339,27 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
             return blocked.format(why="approval prompt could not be delivered or was not answered "
                                       f"({getattr(choice, 'cause', 'no answer')}).")
         timed = choice == "timeout"
+    else:
+        # The same listener/capability helper serves API runs and ordinary gateways.
+        # A non-None lease always requires exact active-lease validation in the wait.
+        notify_cb, capability = listener
+        approval_data = {
+            "command": display,
+            "pattern_key": "protected_instruction_file",
+            "pattern_keys": ["protected_instruction_file"],
+            "description": description,
+            "allow_permanent": False,
+            "allow_session": False}
+        decision = _await_gateway_decision(
+            session_key, notify_cb, approval_data, surface="gateway",
+            api_server_capability=capability,
+            require_api_server_capability=capability is not None,
+        )
+        if decision.get("notify_failed"):
+            return blocked.format(why="requires approval but the approval request could not be delivered.")
+        if decision.get("cancelled"):
+            return blocked.format(why=f"approval was withdrawn before the user answered ({decision['cancelled']}).")
+        choice, timed = decision.get("choice"), not decision.get("resolved")
     # Any tapped scope is a one-operation grant; nothing is persisted.
     if not timed and choice in {"once", "session", "always"}:
         return None

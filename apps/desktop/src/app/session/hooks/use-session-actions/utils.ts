@@ -1138,9 +1138,17 @@ export function preserveLocalPendingTurnMessages(
       }
     }
 
+    // Compaction reissues physical row ids without changing tool-call ids.
+    // A partial receipt may still name a surviving prompt, so receipt eviction
+    // cannot discard this live copy. Cross the row-id conflict only with tool
+    // identity; durableFoldCoversLiveResponse must cover every tool and reply.
+    // Text-only rows retain the strict identity-filtered candidates.
+    const foldCandidates =
+      toolCallIdsOf(message).length > 0 ? (crossedUserBoundary ? remainingNext : acknowledgedTurn) : candidates
+
     if (
       isPendingAssistant &&
-      durableFoldCoversLiveResponse(committedFoldsOfLocalTurn(candidates, previousMessages, index), message)
+      durableFoldCoversLiveResponse(committedFoldsOfLocalTurn(foldCandidates, previousMessages, index), message)
     ) {
       continue
     }

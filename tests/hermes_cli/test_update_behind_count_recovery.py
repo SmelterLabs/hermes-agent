@@ -85,3 +85,93 @@ def test_compare_behind_network_failure_returns_none():
 def test_compare_behind_rejects_malformed_payloads(payload):
     with _patch_urlopen(payload):
         assert source_check._github_compare_behind(SHA_A, SHA_B) is None
+
+
+# ---------------------------------------------------------------------------
+# _behind_count: local-only HEAD recovers its count from the upstream base
+#
+# An overlay branch rebased onto upstream has a HEAD that exists nowhere on
+# GitHub, so compare 404s for it forever -- and because every update re-creates
+# that local-only HEAD, the no-count sentinel would become permanent (the badge
+# reads a bare "update" instead of "+N"). The merge-base with origin/<branch> is
+# an upstream commit, so base...target is the honest distance.
+# ---------------------------------------------------------------------------
+
+SHA_BASE = "c" * 40
+
+
+def _checkout(tmp_path, head=SHA_A):
+    return source_check._Checkout(
+        root=tmp_path,
+        git="git",
+        embedded=None,
+        head=head,
+        current_branch="local/overlay",
+        origin="https://github.com/nousresearch/hermes-agent.git",
+        repository="nousresearch/hermes-agent",
+        dirty=False,
+    )
+
+
+def _no_local_ancestry():
+    """HEAD is not a descendant of target, so the early up-to-date arm cannot fire."""
+    return patch.object(source_check, "_git_ok", return_value=False)
+
+
+def test_behind_count_local_only_head_counts_from_upstream_base(tmp_path):
+    def compare(current, target, repository):
+        # GitHub has never seen the local-only HEAD; it answers only for the base.
+        return {"ahead_by": 2305} if current == SHA_BASE else None
+
+    with _no_local_ancestry(), \
+            patch.object(source_check, "_github_compare", side_effect=compare), \
+            patch.object(source_check, "_git_stdout", return_value=SHA_BASE):
+        behind, _ = source_check._behind_count(_checkout(tmp_path), SHA_B, branch="main")
+
+    assert behind == 2305
+
+
+def test_behind_count_local_base_on_upstream_tip_is_up_to_date(tmp_path):
+    with _no_local_ancestry(), \
+            patch.object(source_check, "_github_compare", return_value=None), \
+            patch.object(source_check, "_git_stdout", return_value=SHA_B):
+        behind, commits = source_check._behind_count(_checkout(tmp_path), SHA_B, branch="main")
+
+    assert (behind, commits) == (0, [])
+
+
+def test_behind_count_keeps_sentinel_when_the_base_compare_also_fails(tmp_path):
+    with _no_local_ancestry(), \
+            patch.object(source_check, "_github_compare", return_value=None), \
+            patch.object(source_check, "_git_stdout", return_value=SHA_BASE):
+        behind, _ = source_check._behind_count(_checkout(tmp_path), SHA_B, branch="main")
+
+    assert behind == source_check.UPDATE_AVAILABLE_NO_COUNT
+
+
+def test_behind_count_keeps_sentinel_when_no_merge_base_resolves(tmp_path):
+    with _no_local_ancestry(), \
+            patch.object(source_check, "_github_compare", return_value=None), \
+            patch.object(source_check, "_git_stdout", return_value=None):
+        behind, _ = source_check._behind_count(_checkout(tmp_path), SHA_B, branch="main")
+
+    assert behind == source_check.UPDATE_AVAILABLE_NO_COUNT
+
+
+def test_behind_count_base_lookup_uses_the_selected_branch(tmp_path):
+    seen = {}
+
+    def git_stdout(args, **kwargs):
+        seen["args"] = args
+        return SHA_BASE
+
+    def compare(current, target, repository):
+        return {"ahead_by": 7} if current == SHA_BASE else None
+
+    with _no_local_ancestry(), \
+            patch.object(source_check, "_github_compare", side_effect=compare), \
+            patch.object(source_check, "_git_stdout", side_effect=git_stdout):
+        behind, _ = source_check._behind_count(_checkout(tmp_path), SHA_B, branch="release")
+
+    assert behind == 7
+    assert seen["args"] == ["merge-base", "HEAD", "origin/release"]

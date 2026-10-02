@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
+import { SESSION_RESUME_REQUEST_TIMEOUT_MS } from '@/api/client'
+
 import { resolveTargetSessionId } from './resolve-target-session'
 
 vi.mock('../use-session-actions/utils', () => ({
@@ -35,12 +37,16 @@ describe('resolveTargetSessionId', () => {
 
     expect(resolved).toBe(RECOVERED)
     expect(createSession).not.toHaveBeenCalled()
-    expect(requestGateway).toHaveBeenCalledWith('session.resume', {
-      session_id: STORED,
-      source: 'desktop',
-      profile: 'work',
-      omit_messages: true
-    })
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.resume',
+      {
+        session_id: STORED,
+        source: 'desktop',
+        profile: 'work',
+        omit_messages: true
+      },
+      SESSION_RESUME_REQUEST_TIMEOUT_MS
+    )
   })
 
   it('reuses the live runtime id when the cache confirms it owns the targeted stored session', async () => {
@@ -140,6 +146,10 @@ describe('resolveTargetSessionId', () => {
       })
     )
 
-    expect(requestGateway).toHaveBeenCalledWith('session.resume', expect.objectContaining({ session_id: STORED }))
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.resume',
+      expect.objectContaining({ session_id: STORED }),
+      SESSION_RESUME_REQUEST_TIMEOUT_MS
+    )
   })
 })

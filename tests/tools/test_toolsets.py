@@ -1,5 +1,7 @@
 """Tests for toolsets.py — toolset resolution, validation, and composition."""
 
+import threading
+
 import toolsets as toolsets_mod
 from tools.registry import ToolRegistry
 from toolsets import (
@@ -217,6 +219,43 @@ class TestResolveToolsetIncludeRegistry:
 
 class TestResolveToolsetMemo:
     """Measured-work pins for the generation-keyed resolution memo."""
+
+    def test_second_resolution_is_cached(self, monkeypatch):
+        """Repeated resolves of the same toolset must not re-walk the registry.
+
+        resolve_toolset is called dozens of times per _get_platform_tools()
+        (every /tools completion keystroke). The memo keyed on the registry
+        generation makes repeat calls a dict lookup instead of a full
+        includes-walk + registry snapshot.
+        """
+        from tools.registry import registry
+
+        toolsets_mod._resolve_toolset_memo.clear()
+        get_toolset_calls = {"n": 0}
+
+        orig_get_toolset = toolsets_mod.get_toolset
+
+        def counting_get_toolset(name, *, include_registry=True):
+            get_toolset_calls["n"] += 1
+            return orig_get_toolset(name, include_registry=include_registry)
+
+        monkeypatch.setattr(toolsets_mod, "get_toolset", counting_get_toolset)
+
+        registry_id = id(registry)
+        generation = registry._generation
+        scope = registry.current_scope_key()
+
+        first = resolve_toolset("hermes-cli")
+        second = resolve_toolset("hermes-cli")
+
+        assert first == second
+        assert get_toolset_calls["n"] == 1, (
+            "second resolution must be a memo hit (no get_toolset re-walk), "
+            f"got {get_toolset_calls['n']} calls"
+        )
+        assert (
+            "hermes-cli", True, registry_id, generation, registry.current_scope_key()
+        ) in toolsets_mod._resolve_toolset_memo
 
     def test_generation_bump_invalidates_memo(self, monkeypatch):
         """A registry mutation (generation bump) must force a fresh resolve."""

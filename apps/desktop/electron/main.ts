@@ -108,6 +108,12 @@ import {
 } from './backend-start-failure'
 import { describeBootstrapFailure } from './bootstrap-failure-copy'
 import {
+  fillBitwardenLogin,
+  listBitwardenLogins,
+  previewGuestBelongsToSender,
+  validateCredentialUrl
+} from './bitwarden-autofill'
+import {
   detectRemoteDisplay,
   isWindowsBinaryPathInWsl,
   isWslEnvironment,
@@ -4361,6 +4367,11 @@ async function claimBackendChild(
     })
 
     child.hermesBackendIdentity = identity
+
+    // A profile owns exactly one backend per app instance; the replacement
+    // policy, its logging, and its never-throw posture live behind the
+    // ownership module boundary.
+    await backendOwnership.retireReplacedSiblings(identity, rememberLog)
 
     return identity
   } catch (error) {
@@ -14418,6 +14429,54 @@ function recordWindowConnectionRoute(sender: Electron.WebContents, route: unknow
 }
 
 ipcMain.on('hermes:connection:active-route', (event, route) => recordWindowConnectionRoute(event.sender, route))
+
+// An apparently open renderer socket can still target a remote dashboard that
+// exited. Probe the exact registry profile before activation; `rebuilt` tells
+// the renderer to close that stale socket and redial the descriptor recovered
+// by the newer dispatch-time liveness path.
+ipcMain.handle('hermes:connection:revalidate-for', async (_event, payload) => {
+  const { connectionId, profile } = payload && typeof payload === 'object' ? (payload as any) : ({} as any)
+  const registry = readDesktopConnectionsRegistry()
+  const id = String(connectionId || '').trim() || registry.primary
+  let key = backendScopeKey(id, profile)
+  const source = registry.connections.find(connection => connection.id === id)
+
+  if (
+    source?.kind === 'local' &&
+    resolveRegistryLocalRoute(connectionScopeKey(profile), {
+      globalRemote: globalRemoteActive(),
+      profileRemoteOverride: Boolean(profileHasRemoteOverride(connectionScopeKey(profile)))
+    }).delegate
+  ) {
+    // ensureRegistryBackend delegates these routes to ensureBackend: shared
+    // profiles have NO pool entry; isolated/override routes use the bare key.
+    // Missing a composite entry is therefore not proof of a stale generation.
+    const connection = await ensureRegistryBackend(id, profile)
+
+    if (connection.sharedPrimary || connectionScopeKey(profile) === primaryProfileKey()) {
+      return { ok: true, rebuilt: false }
+    }
+
+    key = connectionScopeKey(profile)
+  }
+
+  const entry = backendPool.get(key)
+
+  // An open renderer socket with no matching main-process generation is stale
+  // by definition: dispatch recovery already retired or replaced its backend.
+  if (!source || !entry?.connectionPromise) {
+    return { ok: true, rebuilt: true }
+  }
+
+  if (entry.process || !entry.remoteBaseUrl) {
+    return { ok: true, rebuilt: backendPool.get(key) !== entry }
+  }
+
+  const validated = await validateRegistryPooledBackend(key, id, profile, source, entry)
+
+  return { ok: true, rebuilt: validated.rebuilt || backendPool.get(key) !== entry }
+})
+
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
 // so the 'exit'/'error' handlers that would clear a dead connection promise never
 // fire — once the remote becomes unreachable across a sleep/wake the renderer
@@ -17354,6 +17413,87 @@ ipcMain.handle('hermes:stop-find-in-page', event => {
 // The renderer can't know whether a loopback URL is reachable — only main
 // knows which transport backs this gateway. Ask before loading one.
 ipcMain.handle('hermes:preview:reach', async (event, url) => reachablePreviewUrl(event.sender.id, String(url || '')))
+
+// User-initiated credential handoff for the embedded Browser. The renderer
+// sends only the guest id: URL discovery, vault access, account selection and
+// typing all stay in main, so passwords never cross the preload/renderer IPC
+// boundary, touch the clipboard, or enter page JavaScript.
+ipcMain.handle('hermes:preview:bitwarden-autofill', async (event, rawGuestId) => {
+  const owner = BrowserWindow.fromWebContents(event.sender)
+  const showMessage = options => (owner && !owner.isDestroyed() ? dialog.showMessageBox(owner, options) : dialog.showMessageBox(options))
+
+  try {
+    const guestId = Number(rawGuestId)
+    const guest = Number.isInteger(guestId) ? electronWebContents.fromId(guestId) : null
+
+    if (!previewGuestBelongsToSender(event.sender.id, guest || null)) {
+      throw new Error('The Browser page is no longer available.')
+    }
+
+    const expectedUrl = validateCredentialUrl(guest.getURL())
+    const logins = await listBitwardenLogins(expectedUrl)
+
+    if (logins.length === 0) {
+      await showMessage({
+        type: 'info',
+        title: 'Bitwarden',
+        message: 'No saved Bitwarden login matches this page.',
+        detail: new URL(expectedUrl).hostname,
+        buttons: ['OK']
+      })
+
+      return { ok: false, status: 'no-match' }
+    }
+
+    let selectedIndex = 0
+
+    if (logins.length > 1) {
+      const buttons = logins.map(login => (login.username ? `${login.name} — ${login.username}` : login.name))
+      const cancelId = buttons.length
+      buttons.push('Cancel')
+
+      const choice = await showMessage({
+        type: 'question',
+        title: 'Fill from Bitwarden',
+        message: 'Choose the login to fill',
+        detail: new URL(expectedUrl).hostname,
+        buttons,
+        cancelId,
+        defaultId: 0,
+        noLink: true
+      })
+
+      if (choice.response === cancelId) {
+        return { ok: false, status: 'cancelled' }
+      }
+
+      selectedIndex = choice.response
+    }
+
+    // Account selection is asynchronous. Bind the fill to the exact guest and
+    // URL observed before opening the vault; a navigation makes this attempt
+    // stale instead of sending credentials into the new page.
+    if (!previewGuestBelongsToSender(event.sender.id, guest) || validateCredentialUrl(guest.getURL()) !== expectedUrl) {
+      throw new Error('The page changed before Bitwarden could fill it. Try again on the current page.')
+    }
+
+    const result = await fillBitwardenLogin(guest, expectedUrl, logins[selectedIndex])
+
+    return { ok: true, status: 'filled', ...result }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Bitwarden autofill failed.'
+
+    await showMessage({
+      type: 'error',
+      title: 'Bitwarden autofill',
+      message: 'Could not fill this page.',
+      detail: message,
+      buttons: ['OK']
+    })
+
+    return { ok: false, status: 'error' }
+  }
+})
 
 ipcMain.handle('hermes:openPreviewInBrowser', async (_event, url) => {
   if (!(await openPreviewInBrowser(url))) {

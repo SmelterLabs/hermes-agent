@@ -1,6 +1,7 @@
 import { atom } from 'nanostores'
 
 import { persistBoolean, readKey, storedBoolean } from '@/lib/storage'
+import { configureBargeIn } from '@/lib/voice-tuning'
 
 // Desktop read-aloud is local; voice.auto_tts belongs to the messaging gateway.
 const AUTO_SPEAK_KEY = 'hermes.desktop.autoSpeakReplies'
@@ -154,6 +155,24 @@ export function applyThinkingSoundFromConfig(
   config: { voice?: { thinking_sound?: unknown } | null } | null | undefined
 ) {
   $thinkingSoundEnabled.set(config?.voice?.thinking_sound !== false)
+}
+
+// Barge-in playback floor — minimum trigger while TTS plays, 0..1 level
+// scale. An absent key keeps the built-in default; see lib/voice-barge-in. The
+// end-of-utterance silence is `voice.silence_duration` ($voiceSilenceMs above).
+export function applyVoiceTuningFromConfig(config: { voice?: object | null } | null | undefined) {
+  // The typed HermesConfig only names the keys the settings UI edits; these
+  // playback floor is read loosely so an absent key is simply "keep the default".
+  const voice = (config?.voice ?? {}) as Record<string, unknown>
+  const num = (value: unknown) => {
+    const n = typeof value === 'string' ? Number(value) : value
+
+    return typeof n === 'number' && Number.isFinite(n) ? n : undefined
+  }
+
+  configureBargeIn({
+    playbackMinTriggerLevel: num(voice.barge_in_playback_floor)
+  })
 }
 
 /** Persist even an unchanged value, so migrating false is also one-time. */

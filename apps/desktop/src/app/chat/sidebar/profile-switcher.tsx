@@ -24,6 +24,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import { useNavigate } from 'react-router'
 
 import type { ProfileScope } from '@/api/client'
+import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { CodeEditor } from '@/components/chat/code-editor'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -64,6 +65,7 @@ import {
   $activeConnectionId,
   $connectionsRegistry,
   $hasMultipleConnections,
+  $pendingConnectionId,
   selectConnection
 } from '@/store/connections'
 import { $fleetRoster, refreshFleetRoster } from '@/store/fleet-roster'
@@ -74,6 +76,7 @@ import {
   $profileCreateRequest,
   $profileOrder,
   $profiles,
+  $profilesConnectionId,
   $profileScope,
   ALL_PROFILES,
   normalizeProfileKey,
@@ -103,7 +106,14 @@ import { sessionDotClassName } from '../session-status-dot'
 
 import { ConnectionGlyph } from './connection-glyph'
 import { FleetGatewayMenuGroup } from './fleet-gateway-menu-group'
-import { buildRestGroups, countRestAgents, type FleetAgent, type FleetGroup, fleetRouteKey } from './fleet-rail'
+import {
+  buildRestGroups,
+  countRestAgents,
+  type FleetAgent,
+  FLEET_RAIL_ENABLED,
+  type FleetGroup,
+  fleetRouteKey
+} from './fleet-rail'
 import { useLocalDeviceSwitch } from './local-device-switch'
 import { ProfileLaunchContextMenu, ProfileLaunchMenuSection } from './profile-launch-menu'
 import { ProfileRemoteOverrideDialog } from './profile-remote-override-dialog'
@@ -197,7 +207,8 @@ const stepThroughCells: Modifier = ({ containerNodeRect, draggingNodeRect, trans
 export function ProfileRail() {
   const { t, locale } = useI18n()
   const p = t.profiles
-  const profiles = useStore($profiles)
+  const cachedProfiles = useStore($profiles)
+  const profilesConnectionId = useStore($profilesConnectionId)
   const scope = useStore($profileScope)
   const gatewayProfile = useStore($activeGatewayProfile)
   const order = useStore($profileOrder)
@@ -206,6 +217,23 @@ export function ProfileRail() {
   const multipleConnections = useStore($hasMultipleConnections)
   const registry = useStore($connectionsRegistry)
   const activeConnectionId = useStore($activeConnectionId)
+  const pendingConnectionId = useStore($pendingConnectionId)
+
+  // A local NAMED profile resolves no connection id of its own:
+  // gatewayForProfile() builds its secondary via createSecondary(key) with
+  // `connectionId: null` (store/gateway.ts), so activeGatewayConnectionId()
+  // returns null and refreshProfiles() stamps that null onto
+  // $profilesConnectionId. An unknown id means "the active box", NOT "a
+  // different box" — treating it as a mismatch blanked the entire local strip
+  // the moment any named profile was selected, and buildRestGroups() hides the
+  // active gateway from the rail by design, so the squares disappeared from
+  // both surfaces at once. Only blank on a KNOWN cross-connection mismatch.
+  const profiles =
+    pendingConnectionId ||
+    (activeConnectionId && profilesConnectionId !== null && profilesConnectionId !== activeConnectionId)
+      ? []
+      : cachedProfiles
+
   const roster = useStore($fleetRoster)
   const navigate = useNavigate()
   const [createOpen, setCreateOpen] = useState(false)
@@ -226,13 +254,15 @@ export function ProfileRail() {
   const [dragging, setDragging] = useState(false)
   const { dialog: localDeviceDialog, request: requestLocalDevice } = useLocalDeviceSwitch()
 
-  useFleetRoster(multipleConnections)
+  useFleetRoster(FLEET_RAIL_ENABLED && multipleConnections)
 
   const connections = registry?.connections
 
   const restGroups = useMemo(
     () =>
-      multipleConnections ? buildRestGroups({ activeConnectionId, connections: connections ?? [], order, roster }) : [],
+      FLEET_RAIL_ENABLED && multipleConnections
+        ? buildRestGroups({ activeConnectionId, connections: connections ?? [], order, roster })
+        : [],
     [activeConnectionId, connections, multipleConnections, order, roster]
   )
 
@@ -543,27 +573,38 @@ export function ProfileRail() {
         (defaultProfile ? (
           // On default → toggle to all. Anywhere else (all view or a named
           // profile) → return to default. So leaving a profile never lands on all.
-          <ProfilePill
-            active={isAll || onDefault}
-            connectionId={activeConnectionId ?? undefined}
-            glyph={isAll ? 'layers' : 'home'}
-            label={onDefault ? p.showAllProfiles : p.switchToProfile(profileLabel(defaultProfile))}
-            onSelect={() => (onDefault ? setShowAllProfiles(true) : selectProfile(defaultProfile.name))}
-            profile={defaultProfile.name}
-          />
+          isAll ? (
+            <ProfilePill
+              active
+              connectionId={activeConnectionId ?? undefined}
+              glyph="layers"
+              label={p.switchToProfile(profileLabel(defaultProfile))}
+              onSelect={() => selectProfile(defaultProfile.name)}
+              profile={defaultProfile.name}
+            />
+          ) : (
+            <OwnerProfilePill
+              active={onDefault}
+              color={resolveProfileColor(profileLabel(defaultProfile), colors)}
+              connectionId={activeConnectionId ?? undefined}
+              label={profileLabel(defaultProfile)}
+              onSelect={() => (onDefault ? setShowAllProfiles(true) : selectProfile(defaultProfile.name))}
+              profileName={defaultProfile.name}
+            />
+          )
         ) : (
           <ProfilePill active={isAll} glyph="layers" label={p.allProfiles} onSelect={() => setShowAllProfiles(true)} />
         ))}
 
-      {/* Single-profile: the active default's home icon next to the create +. */}
+      {/* Single-profile: show the configured default owner identity next to create. */}
       {!fleet && !multiProfile && defaultProfile && (
-        <ProfilePill
+        <OwnerProfilePill
           active
+          color={resolveProfileColor(profileLabel(defaultProfile), colors)}
           connectionId={activeConnectionId ?? undefined}
-          glyph="home"
           label={profileLabel(defaultProfile)}
           onSelect={() => selectProfile(defaultProfile.name)}
-          profile={defaultProfile.name}
+          profileName={defaultProfile.name}
         />
       )}
 
@@ -618,13 +659,13 @@ export function ProfileRail() {
                           role="group"
                         >
                           {defaultProfile && (
-                            <ProfilePill
+                            <OwnerProfilePill
                               active={onDefault}
+                              color={resolveProfileColor(profileLabel(defaultProfile), colors)}
                               connectionId={activeConnectionId ?? undefined}
-                              glyph="home"
                               label={profileLabel(defaultProfile)}
                               onSelect={() => selectProfile(defaultProfile.name)}
-                              profile={defaultProfile.name}
+                              profileName={defaultProfile.name}
                             />
                           )}
                           {activeStrip}
@@ -1056,6 +1097,86 @@ function RestDropdownItem({
           {summary && <ProfileStatusDot summary={summary} />}
         </span>
       </DropdownMenuItem>
+    </ProfileLaunchContextMenu>
+  )
+}
+
+function useProfileAvatar(profileName: string): string | null {
+  const { gateway, requestGateway } = useGatewayRequest()
+  const [avatar, setAvatar] = useState<null | string>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    setAvatar(null)
+
+    void requestGateway<{ data?: string; found?: boolean }>('profiles.get_asset', {
+      asset: 'avatar',
+      name: profileName
+    })
+      .then(result => {
+        if (!cancelled) {
+          setAvatar(result?.found && result.data ? result.data : null)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setAvatar(null)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [gateway, profileName, requestGateway])
+
+  return avatar
+}
+
+function OwnerProfilePill({
+  active,
+  color,
+  connectionId,
+  label,
+  onSelect,
+  profileName
+}: {
+  active: boolean
+  color: null | string
+  connectionId?: string
+  label: string
+  onSelect: () => void
+  profileName: string
+}) {
+  const avatar = useProfileAvatar(profileName)
+  const initial = label.trim().charAt(0).toUpperCase() || 'H'
+
+  // Same right-click launch menu upstream's home ProfilePill carries.
+  return (
+    <ProfileLaunchContextMenu connectionId={connectionId ?? null} label={profileName} profile={profileName}>
+    <Tip label={label}>
+      <Button
+        aria-label={label}
+        aria-pressed={active}
+        className={cn(
+          'shrink-0 bg-transparent text-(--ui-text-tertiary) hover:bg-(--ui-control-hover-background) hover:text-foreground',
+          active ? 'gap-1.5 px-2 text-foreground' : 'rounded-full p-0 ring-1 ring-inset ring-border'
+        )}
+        data-slot="profile-owner-pill"
+        onClick={onSelect}
+        size={active ? 'xs' : 'icon-xs'}
+        style={color ? { backgroundColor: profileColorSoft(color) } : undefined}
+        variant="ghost"
+      >
+        {avatar ? (
+          <img alt="" className="size-4 shrink-0 rounded-full object-cover" src={avatar} />
+        ) : (
+          <span aria-hidden="true" className="flex size-4 shrink-0 items-center justify-center text-[10px] font-semibold">
+            {initial}
+          </span>
+        )}
+        {active && <span className="max-w-24 truncate">{label}</span>}
+      </Button>
+    </Tip>
     </ProfileLaunchContextMenu>
   )
 }

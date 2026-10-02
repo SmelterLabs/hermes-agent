@@ -80,7 +80,12 @@ def _write_plugin(hermes_home: Path) -> None:
     )
 
 
-def _write_profile_probe(hermes_home: Path, marker: str) -> None:
+def _write_profile_probe(
+    hermes_home: Path,
+    marker: str,
+    *,
+    agentphone_tool_name: str | None = None,
+) -> None:
     plugin_dir = hermes_home / "plugins" / "profile_probe"
     plugin_dir.mkdir(parents=True)
     (plugin_dir / "plugin.yaml").write_text(
@@ -92,6 +97,16 @@ def _write_profile_probe(hermes_home: Path, marker: str) -> None:
             }
         )
     )
+    agentphone_registration = ""
+    if agentphone_tool_name:
+        agentphone_registration = (
+            "    ctx.register_tool(\n"
+            f"        name={agentphone_tool_name!r},\n"
+            "        toolset='agentphone_call',\n"
+            f"        schema={{'name': {agentphone_tool_name!r}, 'parameters': {{'type': 'object', 'properties': {{}}}}}},\n"
+            f"        handler=lambda args, **kwargs: {marker!r},\n"
+            "    )\n"
+        )
     (plugin_dir / "__init__.py").write_text(
         "def register(ctx):\n"
         "    ctx.register_tool(\n"
@@ -106,6 +121,7 @@ def _write_profile_probe(hermes_home: Path, marker: str) -> None:
         f"        adapter_factory=lambda config: {marker!r},\n"
         "        check_fn=lambda: True,\n"
         "    )\n"
+        + agentphone_registration
     )
     (hermes_home / "config.yaml").write_text(
         yaml.safe_dump({"plugins": {"enabled": ["profile_probe"]}})
@@ -1172,18 +1188,29 @@ def test_same_name_tool_and_platform_are_isolated_by_hermes_home(
     from gateway.platform_registry import platform_registry
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from hermes_cli.plugins import PluginManager
+    import toolsets as toolsets_mod
+    from toolsets import resolve_toolset
     from tools.registry import registry
 
     home_a = tmp_path / "profile-a"
     home_b = tmp_path / "profile-b"
-    _write_profile_probe(home_a, "profile-a")
-    _write_profile_probe(home_b, "profile-b")
+    _write_profile_probe(
+        home_a,
+        "profile-a",
+        agentphone_tool_name="place_outbound_call",
+    )
+    _write_profile_probe(
+        home_b,
+        "profile-b",
+        agentphone_tool_name="clyde_phone_call",
+    )
     monkeypatch.setattr(
         plugins_mod,
         "get_bundled_plugins_dir",
         lambda: tmp_path / "empty-bundled",
     )
     monkeypatch.setattr(PluginManager, "_scan_entry_points", lambda self: [])
+    toolsets_mod._resolve_toolset_memo.clear()
 
     def load_profile(home: Path):
         token = set_hermes_home_override(home)
@@ -1192,21 +1219,25 @@ def test_same_name_tool_and_platform_are_isolated_by_hermes_home(
             manager.discover_and_load()
             tool_entry = registry.get_entry("shared_profile_tool")
             platform_entry = platform_registry.get("shared_profile_platform")
-            return manager, tool_entry, platform_entry
+            agentphone_tools = resolve_toolset("agentphone_call")
+            return manager, tool_entry, platform_entry, agentphone_tools
         finally:
             reset_hermes_home_override(token)
 
-    manager_a, tool_a, platform_a = load_profile(home_a)
-    manager_b, tool_b, platform_b = load_profile(home_b)
+    manager_a, tool_a, platform_a, agentphone_a = load_profile(home_a)
+    manager_b, tool_b, platform_b, agentphone_b = load_profile(home_b)
 
     assert manager_a is not manager_b
     assert tool_a is not None and tool_b is not None and tool_a is not tool_b
     assert platform_a is not None and platform_b is not None and platform_a is not platform_b
+    assert agentphone_a == ["place_outbound_call"]
+    assert agentphone_b == ["clyde_phone_call"]
 
     token_a = set_hermes_home_override(home_a)
     try:
         assert registry.dispatch("shared_profile_tool", {}) == "profile-a"
         assert platform_registry.get("shared_profile_platform") is platform_a
+        assert resolve_toolset("agentphone_call") == ["place_outbound_call"]
     finally:
         reset_hermes_home_override(token_a)
 
@@ -1214,6 +1245,7 @@ def test_same_name_tool_and_platform_are_isolated_by_hermes_home(
     try:
         assert registry.dispatch("shared_profile_tool", {}) == "profile-b"
         assert platform_registry.get("shared_profile_platform") is platform_b
+        assert resolve_toolset("agentphone_call") == ["clyde_phone_call"]
     finally:
         reset_hermes_home_override(token_b)
 
@@ -1221,6 +1253,7 @@ def test_same_name_tool_and_platform_are_isolated_by_hermes_home(
     try:
         assert registry.dispatch("shared_profile_tool", {}) == "profile-a"
         assert platform_registry.get("shared_profile_platform") is platform_a
+        assert resolve_toolset("agentphone_call") == ["place_outbound_call"]
     finally:
         reset_hermes_home_override(token_a)
 

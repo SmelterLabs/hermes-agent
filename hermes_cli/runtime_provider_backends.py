@@ -270,6 +270,27 @@ def _is_external_process_provider(provider: str) -> bool:
     return profile is not None and getattr(profile, "auth_type", "") == "external_process"
 
 
+def _external_process_streams(provider: str) -> bool:
+    """An external-process provider streams only when its profile opts in
+    (``streams_completions=True``); the default keeps ACP/stdio agents non-streaming."""
+    name = (provider or "").strip().lower()
+    if not name:
+        return False
+    try:
+        pconfig = _rp().PROVIDER_REGISTRY.get(name)
+        if pconfig is not None and getattr(pconfig, "streams_completions", None) is not None:
+            return bool(getattr(pconfig, "streams_completions"))
+    except Exception:
+        pass
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(name)
+    except Exception:
+        return False
+    return profile is not None and bool(getattr(profile, "streams_completions", False))
+
+
 def _resolve_external_process_runtime(provider: str, requested_provider: str) -> dict[str, Any]:
     rp = _rp()
     creds = rp.resolve_external_process_provider_credentials(provider)

@@ -741,11 +741,11 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                 # pressure and take every platform heartbeat down.
                 if await asyncio.to_thread(drain_requested):
                     self._enter_external_drain()
-                    # API and cron work live outside messaging's _running_agents map; refresh the
-                    # aggregate while an external caller polls this reversible drain state.
-                    self._persist_active_agents()
                 else:
                     self._exit_external_drain()
+                # API/cron completion need not cross a messaging turn boundary. Refresh while
+                # running too, or an idle-only maintenance preflight can stay falsely busy forever.
+                self._persist_active_agents()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

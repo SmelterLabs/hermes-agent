@@ -1,3 +1,5 @@
+import { SESSION_RESUME_REQUEST_TIMEOUT_MS } from '@/api/client'
+
 import { resolveSessionProfile } from '../use-session-actions/utils'
 
 import { singleFlightSessionResume, takeRecoveredRuntime } from './single-flight-resume'
@@ -101,17 +103,19 @@ export async function resolveTargetSessionId(deps: ResolveTargetSessionDeps): Pr
       const resumed = await singleFlightSessionResume(storedTarget, async () => {
         const profile = await resolveSessionProfile(storedTarget)
 
-        return requestGateway<{ session_id?: string }>('session.resume', {
-          session_id: storedTarget,
-          source: 'desktop',
-          // Same contract as every other desktop resume: the response must
-          // not inline a full compression lineage (deep ones exceed
-          // max_resume_messages and fail assert_resume_safe). Only the
-          // resolved tip session_id is consumed here; the gateway follows
-          // mid → tip itself (#125041).
-          omit_messages: true,
-          ...(profile ? { profile } : {})
-        })
+        return requestGateway<{ session_id?: string }>(
+          'session.resume',
+          {
+            session_id: storedTarget,
+            source: 'desktop',
+            // Resolve the live tip without inlining its compression lineage.
+            omit_messages: true,
+            ...(profile ? { profile } : {})
+          },
+          // Cold resumes run a full server-side agent build (30s-minutes);
+          // the generic 30s ack budget failed every first open.
+          SESSION_RESUME_REQUEST_TIMEOUT_MS
+        )
       })
 
       return resumed?.session_id || null

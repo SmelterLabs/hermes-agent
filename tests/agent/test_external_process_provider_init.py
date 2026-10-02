@@ -97,3 +97,21 @@ def test_should_stream_is_off_for_any_external_process_profile(monkeypatch):
 
     assert _should_stream(make("acme-acp")) is False
     assert _should_stream(make("acme-http")) is True
+
+
+def test_should_stream_honours_an_external_process_opt_in(monkeypatch):
+    """An external-process provider whose client yields chunk objects for ``stream=True``
+    (the Claude direct-SDK plugin) opts in with ``streams_completions``; without the flag the
+    profile stays non-streaming (Clyde PM 2026-09-25: the Claude route sent no deltas)."""
+    from agent.turn_api_call import _should_stream
+    from providers.base import ProviderProfile
+
+    streaming = ProviderProfile(name="acme-sdk", auth_type="external_process", streams_completions=True)
+    silent = ProviderProfile(name="acme-acp", auth_type="external_process")
+    profiles = {streaming.name: streaming, silent.name: silent}
+    monkeypatch.setattr("providers.get_provider_profile", lambda name: profiles.get(name))
+    make = lambda provider: SimpleNamespace(  # noqa: E731
+        provider=provider, base_url="process://acme", _has_stream_consumers=lambda: True)
+
+    assert _should_stream(make("acme-sdk")) is True
+    assert _should_stream(make("acme-acp")) is False

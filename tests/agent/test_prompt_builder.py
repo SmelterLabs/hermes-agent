@@ -1045,3 +1045,39 @@ class TestContextFileReadTimeout:
 
         with pytest.raises(FileNotFoundError):
             _read_text_with_timeout(tmp_path / "missing.md", timeout=1.0)
+# =========================================================================
+# HERMES.md @import expansion (local overlay, 2026-09-01)
+# =========================================================================
+class TestHermesMdImports:
+    def test_expands_relative_and_absolute_imports_one_level(self, tmp_path):
+        (tmp_path / "CLAUDE.md").write_text("Project rule: always verify.\n@nested.md\n")
+        (tmp_path / "nested.md").write_text("NESTED-BODY-SHOULD-NOT-INLINE")
+        other = tmp_path / "elsewhere"
+        other.mkdir()
+        (other / "global.md").write_text("Global rule: no yes-man.")
+        (tmp_path / "HERMES.md").write_text(
+            "# Kernel\n@CLAUDE.md\n@" + str(other / "global.md") + "\n## On demand\n- read nested.md when needed\n"
+        )
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Project rule: always verify." in result
+        assert "Global rule: no yes-man." in result
+        assert "Imported: CLAUDE.md" in result
+        # One level only: the import inside CLAUDE.md stays a literal pointer.
+        assert "@nested.md" in result
+        assert "NESTED-BODY-SHOULD-NOT-INLINE" not in result
+        # Non-import lines survive verbatim.
+        assert "read nested.md when needed" in result
+
+    def test_missing_import_becomes_visible_notice(self, tmp_path):
+        (tmp_path / "HERMES.md").write_text("@does-not-exist.md\nstill here\n")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "HERMES.md import missing" in result
+        assert "does-not-exist.md" in result
+        assert "still here" in result
+
+    def test_email_like_and_indented_at_lines_are_not_imports(self, tmp_path):
+        (tmp_path / "HERMES.md").write_text("contact casey@russellhome.net\n  @not-an-import.md\n")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "casey@russellhome.net" in result
+        assert "  @not-an-import.md" in result
+        assert "import missing" not in result

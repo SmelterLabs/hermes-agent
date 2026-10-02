@@ -3,11 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { reasoningEffortPending } from '@/app/chat/session-view'
 import type { ClientSessionState } from '@/app/types'
+import { SESSION_RESUME_REQUEST_TIMEOUT_MS } from '@/api/client'
 import type * as HermesModule from '@/hermes'
 import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
-import { $notifications } from '@/store/notifications'
+import { $notifications, setToastMessagesEnabled } from '@/store/notifications'
 import { $cronRunReadOnlyVerdicts, recordCronRunVerdict } from '@/store/read-only-transcript'
 import { $activeSessionId, setSessionOwnerHint, setSessions } from '@/store/session'
 import { $sessionTiles, sessionTileDelegate } from '@/store/session-states'
@@ -114,7 +115,7 @@ describe('useSessionTileDelegate resumeTile', () => {
         profile: 'ai-engineer',
         omit_messages: true
       },
-      undefined,
+      SESSION_RESUME_REQUEST_TIMEOUT_MS,
       undefined
     )
     expect(requestGateway).not.toHaveBeenCalled()
@@ -142,7 +143,7 @@ describe('useSessionTileDelegate resumeTile', () => {
         profile: 'default',
         omit_messages: true
       },
-      undefined,
+      SESSION_RESUME_REQUEST_TIMEOUT_MS,
       undefined
     )
     expect(requestGateway).not.toHaveBeenCalled()
@@ -158,12 +159,19 @@ describe('useSessionTileDelegate resumeTile', () => {
     const runtimeId = await sessionTileDelegate()!.resumeTile('stored-shared')
 
     expect(runtimeId).toBe('runtime-shared')
-    expect(requestGatewayForAgent).toHaveBeenCalledWith('source-b', 'default', 'session.resume', {
-      session_id: 'stored-shared',
-      cols: 96,
-      omit_messages: true,
-      profile: 'default'
-    })
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'source-b',
+      'default',
+      'session.resume',
+      {
+        session_id: 'stored-shared',
+        cols: 96,
+        omit_messages: true,
+        profile: 'default'
+      },
+      SESSION_RESUME_REQUEST_TIMEOUT_MS,
+      undefined
+    )
     expect(ambientRequest).not.toHaveBeenCalled()
   })
 
@@ -187,12 +195,19 @@ describe('useSessionTileDelegate resumeTile', () => {
       connectionId: 'barry',
       profile: 'backend-oxcoder'
     })
-    expect(requestGatewayForAgent).toHaveBeenCalledWith('barry', 'oxcoder', 'session.resume', {
-      session_id: 'stored-remote',
-      cols: 96,
-      omit_messages: true,
-      profile: 'backend-oxcoder'
-    })
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'barry',
+      'oxcoder',
+      'session.resume',
+      {
+        session_id: 'stored-remote',
+        cols: 96,
+        omit_messages: true,
+        profile: 'backend-oxcoder'
+      },
+      SESSION_RESUME_REQUEST_TIMEOUT_MS,
+      undefined
+    )
     expect(ambientRequest).not.toHaveBeenCalled()
   })
 
@@ -577,7 +592,7 @@ describe('useSessionTileDelegate resumeTile', () => {
         profile: 'default',
         omit_messages: true
       },
-      undefined,
+      SESSION_RESUME_REQUEST_TIMEOUT_MS,
       undefined
     )
   })
@@ -772,6 +787,8 @@ describe('useSessionTileDelegate send from a tile behind the stored transcript',
   beforeEach(() => {
     setSessions([])
     $notifications.set([])
+    // PC ships toast messages suppressed; this suite asserts the warning toast.
+    setToastMessagesEnabled(true)
     vi.mocked(getLatestSessionMessages).mockReset()
     vi.mocked(getLatestSessionMessages).mockImplementation(async () => ({ messages: [], session_id: storedId }))
   })
@@ -897,7 +914,7 @@ describe('useSessionTileDelegate submitToSession', () => {
         omit_messages: true,
         profile: 'default'
       },
-      undefined,
+        SESSION_RESUME_REQUEST_TIMEOUT_MS,
       undefined
     )
     expect(routed).toHaveBeenNthCalledWith(

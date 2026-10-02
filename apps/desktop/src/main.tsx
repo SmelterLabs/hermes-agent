@@ -89,7 +89,23 @@ if (winParam === 'overlay') {
   // animations stop producing frames when nobody can see them.
   installRendererAnimationPauseState()
 
-  createRoot(document.getElementById('root')!).render(
+  const formatRecoverableError = (error: unknown): string => {
+    if (error instanceof Error) {
+      const cause = error.cause instanceof Error ? `\nCause: ${error.cause.stack ?? error.cause.message}` : ''
+
+      return `${error.stack ?? `${error.name}: ${error.message}`}${cause}`
+    }
+
+    return String(error)
+  }
+
+  createRoot(document.getElementById('root')!, {
+    onRecoverableError: (error, errorInfo) => {
+      console.error(
+        `[react recoverable] ${formatRecoverableError(error)}\nComponent stack:${errorInfo.componentStack ?? '<none>'}`
+      )
+    }
+  }).render(
     <StrictMode>
       <RootErrorBoundary>
         <QueryClientProvider client={queryClient}>

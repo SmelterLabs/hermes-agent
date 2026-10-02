@@ -224,7 +224,8 @@ def _session_start_like(agent: Any, now: Any) -> Any:
 
 def _agent_home(agent: Any) -> Optional[Path]:
     """The agent's OWN profile home, or None to use ambient resolution.
-    A bound HERMES_HOME ContextVar override wins (the gateway multiplexes
+    An explicit API creation-time pin wins, including on bare worker threads.
+    Otherwise a bound HERMES_HOME ContextVar override wins (the gateway multiplexes
     profiles over one shared session DB and binds the home per turn); else the
     parent of ``_session_db.db_path`` — ground truth on threads that lost the
     ContextVar, where ambient resolution would leak the launch profile.
@@ -238,6 +239,9 @@ def _agent_home(agent: Any) -> Optional[Path]:
     into ``threading.Thread``), where the unbound build previously fell back to the launch home and leaked
     the default profile's skills/identity into a bot prompt.
     """
+    pin = getattr(agent, "_hermes_profile_home_pin", None)
+    if pin:
+        return Path(pin)
     try:
         from hermes_constants import get_hermes_home_override
         override = get_hermes_home_override()

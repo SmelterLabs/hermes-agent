@@ -568,6 +568,12 @@ declare global {
         write: (id: string, data: string) => Promise<boolean>
       }
       reachPreviewUrl?: (url: string) => Promise<string>
+      autofillPreviewFromBitwarden?: (guestId: number) => Promise<{
+        ok: boolean
+        status: 'cancelled' | 'error' | 'filled' | 'no-match'
+        passwordFilled?: boolean
+        usernameFilled?: boolean
+      }>
       setActiveConnectionRoute?: (
         route: {
           connectionId?: null | string

@@ -6,6 +6,7 @@ import { useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { PRIMARY_SESSION_VIEW } from '@/app/chat/session-view'
+import { SESSION_RESUME_REQUEST_TIMEOUT_MS } from '@/api/client'
 import { NO_PROJECT_ID } from '@/app/chat/sidebar/projects/workspace-groups'
 import { resolveSessionRpcOwner } from '@/app/contrib/wiring-routing'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
@@ -33,7 +34,7 @@ import {
 } from '@/store/gateway'
 import { $goalsBySession, type SessionGoal } from '@/store/goals'
 import { $pinnedSessionIds } from '@/store/layout'
-import { $notifications, dismissNotification } from '@/store/notifications'
+import { $notifications, dismissNotification, setToastMessagesEnabled } from '@/store/notifications'
 import {
   $activeGatewayProfile,
   $newChatConnectionId,
@@ -2334,7 +2335,7 @@ describe('resumeSession failure recovery', () => {
 
     const resumePromise = resume!('stored-1', true)
 
-    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('session.resume', expect.anything()))
+    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('session.resume', expect.anything(), SESSION_RESUME_REQUEST_TIMEOUT_MS))
 
     const runtimeState = clientState('stored-1')
     runtimeState.messages = [
@@ -2560,7 +2561,9 @@ describe('resumeSession failure recovery', () => {
     act(() => {
       resumePromise = resume!('stored-1', true)
     })
-    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('session.resume', expect.any(Object)))
+    await waitFor(() =>
+      expect(requestGateway).toHaveBeenCalledWith('session.resume', expect.any(Object), SESSION_RESUME_REQUEST_TIMEOUT_MS)
+    )
 
     // The visible timer is anchored before the delayed RPC resolves.
     expect($sessionStartedAt.get()).toBe(resumeStartedAt)
@@ -4236,7 +4239,9 @@ describe('resumeSession warm-cache mapping integrity', () => {
       'hermes01',
       'default',
       'session.resume',
-      expect.objectContaining({ session_id: 'remote-stored' })
+      expect.objectContaining({ session_id: 'remote-stored' }),
+      SESSION_RESUME_REQUEST_TIMEOUT_MS,
+      undefined
     )
     expect(requestGatewayForProfile).not.toHaveBeenCalled()
     expect(ambientRequest).not.toHaveBeenCalled()
@@ -4358,7 +4363,9 @@ describe('resumeSession warm-cache mapping integrity', () => {
       'source-a',
       'default',
       'session.resume',
-      expect.objectContaining({ session_id: 'stored-cold' })
+      expect.objectContaining({ session_id: 'stored-cold' }),
+      SESSION_RESUME_REQUEST_TIMEOUT_MS,
+      undefined
     )
     expect(ambientRequest).not.toHaveBeenCalled()
   })
@@ -4401,7 +4408,9 @@ describe('resumeSession warm-cache mapping integrity', () => {
       'test-amnezia',
       'default',
       'session.resume',
-      expect.objectContaining({ session_id: 'stored-registry' })
+      expect.objectContaining({ session_id: 'stored-registry' }),
+      SESSION_RESUME_REQUEST_TIMEOUT_MS,
+      undefined
     )
     expect(ambientRequest).not.toHaveBeenCalled()
   })
@@ -7092,7 +7101,13 @@ describe('routed fresh chat keeps its exact owner across turns', () => {
 // catch surfaces a persistent error notification with a Retry action so the
 // user can re-attempt without re-doing the whole branch flow.
 describe('branchStoredSession failure retry', () => {
+  beforeEach(() => {
+    // PC suppresses toasts by default; this suite exercises the enabled path.
+    setToastMessagesEnabled(true)
+  })
+
   afterEach(() => {
+    setToastMessagesEnabled(false)
     cleanup()
     setSessions([])
     $notifications.get().forEach(n => dismissNotification(n.id))

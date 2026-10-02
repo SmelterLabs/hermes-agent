@@ -118,6 +118,14 @@ def _stale_holder(row, now: float) -> bool:
     return float(row["expires_at"]) <= now or _compression_lock_holder_process_is_dead(row["holder"])
 
 
+def _reject_nonfinite_json_constant(value: str) -> None:
+    """Make ``json.loads`` enforce RFC-compliant numeric values."""
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
+CLYDE_PROACTIVE_SESSION_ID = "clyde-proactive"
+
+
 class SessionMessagesMixin(SessionDetachedResultsMixin):
     """Message append/replace/rewind, reactions, resume conversations, replay dedupe (detached results: the base)."""
 
@@ -420,6 +428,151 @@ class SessionMessagesMixin(SessionDetachedResultsMixin):
         # THE critical write (failure aborts the turn): long patience so a sibling legitimately
         # holding the lock for seconds (VACUUM, checkpoint) can't kill it.
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
+    def ensure_proactive_session(self, source: str = "proactive") -> str:
+        """Deterministically resolve the canonical Proactive Clyde session.
+
+        Returns the fixed, device-shared :data:`CLYDE_PROACTIVE_SESSION_ID`,
+        creating its ``sessions`` row idempotently (INSERT OR IGNORE via the
+        shared ``ensure_session`` upsert) so the messages FK target exists.
+        Calling this repeatedly is a no-op after the first create and always
+        returns the same stable id — no random or per-run identity is ever
+        minted.
+        """
+        return self.ensure_session(CLYDE_PROACTIVE_SESSION_ID, source=source)
+
+    def append_assistant_message_idempotent(
+        self,
+        session_id: str,
+        content: str,
+        dedupe_key: str,
+        timestamp: Any = None,
+        *,
+        display_kind: Optional[str] = None,
+        display_metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Append a STANDALONE assistant message, idempotent on ``dedupe_key``.
+
+        ``dedupe_key`` is stored in ``platform_message_id``; a replay with the
+        same ``(session_id, dedupe_key)`` returns the SAME row id and inserts
+        NO second row. The select-then-insert runs inside ONE
+        ``_execute_write`` (BEGIN IMMEDIATE) transaction, so the write lock —
+        not a UNIQUE constraint — provides the idempotency guarantee.
+
+        The row is ``role='assistant'`` with ``active=1``. Callers may mark it
+        as a generic display event with ``display_kind='event'`` and optional
+        JSON-object ``display_metadata``. Event ``source`` and ``severity``
+        values, when present, must be non-empty strings. Invalid presentation
+        fields are ignored (and never prevent the durable content append),
+        matching the existing display-metadata write convention.
+
+        Omitting the new keyword-only display arguments preserves the original
+        row shape. Idempotent replays never update an existing row, including
+        its display fields.
+
+        Returns the message row id.
+        """
+        stored_content = self._encode_content(content)
+
+        stored_display_kind: Optional[str] = None
+        display_metadata_json: Optional[str] = None
+        if display_kind is None:
+            if display_metadata is not None:
+                logger.warning(
+                    "Ignoring proactive display metadata without display_kind='event'"
+                )
+        elif display_kind != "event":
+            logger.warning(
+                "Ignoring unsupported proactive display kind on write: %r",
+                display_kind,
+            )
+        else:
+            stored_display_kind = "event"
+            try:
+                display_metadata_json = self._encode_display_metadata(display_metadata)
+                # Proactive presentation metadata must not prevent durable content
+                # writes. Keep its stricter contract local to this producer.
+                metadata_object = (
+                    json.loads(display_metadata_json, parse_constant=_reject_nonfinite_json_constant)
+                    if display_metadata_json is not None else None
+                )
+            except (TypeError, ValueError, RecursionError):
+                logger.warning("Ignoring invalid proactive display metadata on write")
+                display_metadata_json = None
+            if display_metadata_json is not None:
+                invalid_field = None
+                if metadata_object is None:
+                    display_metadata_json = None
+                else:
+                    invalid_field = next(
+                        (
+                            field
+                            for field in ("source", "severity")
+                            if field in metadata_object
+                            and (
+                                not isinstance(metadata_object[field], str)
+                                or not metadata_object[field].strip()
+                            )
+                        ),
+                        None,
+                    )
+                if metadata_object is not None and invalid_field is not None:
+                    logger.warning(
+                        "Ignoring proactive display metadata with invalid %s",
+                        invalid_field,
+                    )
+                    display_metadata_json = None
+
+        message_timestamp = time.time()
+        if timestamp is not None:
+            try:
+                if hasattr(timestamp, "timestamp"):
+                    message_timestamp = float(timestamp.timestamp())
+                else:
+                    message_timestamp = float(timestamp)
+            except (TypeError, ValueError):
+                logger.debug(
+                    "Ignoring invalid explicit proactive message timestamp: %r",
+                    timestamp,
+                )
+
+        def _do(conn):
+            existing = conn.execute(
+                "SELECT id FROM messages "
+                "WHERE session_id = ? AND platform_message_id = ? LIMIT 1",
+                (session_id, dedupe_key),
+            ).fetchone()
+            if existing is not None:
+                # Idempotent replay: the entry is already durable — do not
+                # insert a second row or touch the session counter.
+                return existing[0]
+
+            cursor = conn.execute(
+                """INSERT INTO messages (session_id, role, content,
+                   platform_message_id, timestamp, active, display_kind,
+                   display_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    "assistant",
+                    stored_content,
+                    dedupe_key,
+                    message_timestamp,
+                    1,
+                    stored_display_kind,
+                    display_metadata_json,
+                ),
+            )
+            msg_id = cursor.lastrowid
+            conn.execute(
+                "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+                (session_id,),
+            )
+            return msg_id
+
+        return self._execute_write(
+            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
 
     def append_messages_batch(
         self, session_id: str, messages: list[dict[str, Any]], compression_lock_holder: Optional[str] = None,

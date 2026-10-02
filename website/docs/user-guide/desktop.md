@@ -60,6 +60,19 @@ The center of the app. You get:
 
 Async cron and delegation completions appear as collapsed timeline disclosures. Open the completion label to read the result body (including job output) as Markdown; long reports scroll within the disclosure. Task instructions and delivery envelopes are not shown as report content.
 
+#### Turn boundaries and background compaction
+
+Reaching the model-call limit does not mean the task is finished. The backend
+can start a synthesized continuation turn, bounded by
+`desktop.auto_continue.max_attempts`; setting `desktop.auto_continue.enabled`
+to `false` disables it. Queued user prompts take priority.
+
+After queued work and follow-up turns have drained, an over-threshold idle
+conversation can compact in the background without waiting for another user
+message. The worker uses that session's profile configuration and credentials,
+not the desktop backend's default profile. A failed attempt waits five minutes
+before retrying. The context meter updates when compaction settles.
+
 #### Status bar
 
 The bar along the bottom of the chat shows live session state and exposes quick controls without opening Settings:

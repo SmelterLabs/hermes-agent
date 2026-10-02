@@ -91,6 +91,40 @@ afterEach(() => {
 })
 
 describe('requestGatewayForProfile', () => {
+  it('reuses the active registry agent instead of spawning a same-named local profile', async () => {
+    const primary = makePrimary()
+    const getConnection = vi.fn(async (profile: null | string) => ({ port: 4242, profile, token: 'local-token' }))
+
+    const getConnectionFor = vi.fn(async ({ connectionId, profile }) => ({
+      connectionId,
+      port: 5151,
+      profile,
+      token: 'registry-token'
+    }))
+
+    setPrimaryGateway(primary as never, 'default')
+    ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
+      getConnection,
+      getConnectionFor,
+      getGatewayWsUrlFor: vi.fn(async ({ connectionId, profile }) => ({
+        ok: true as const,
+        wsUrl: `ws://${connectionId}/${profile}`
+      }))
+    }
+
+    await ensureGatewayForAgent('forge', 'sagan')
+    getConnection.mockClear()
+    getConnectionFor.mockClear()
+
+    const result = await requestGatewayForProfile('sagan', 'session.list', { limit: 20 })
+
+    expect(result).toEqual({ method: 'session.list', params: { limit: 20 } })
+    expect(getConnectionFor).not.toHaveBeenCalled()
+    expect(getConnection).not.toHaveBeenCalled()
+    expect(secondaryGateways).toHaveLength(1)
+    expect(secondaryGateways[0].request).toHaveBeenCalledWith('session.list', { limit: 20 })
+  })
+
   it('requests through a pooled profile gateway without changing the active gateway', async () => {
     const primary = makePrimary()
     setPrimaryGateway(primary as never, 'default')
@@ -654,6 +688,36 @@ describe('retainGatewayForAgent (#93602)', () => {
 })
 
 describe('attached shared-remote group turns (#96493)', () => {
+  it('reuses and scopes the attached LOCAL host backend without dialing a secondary', async () => {
+    const primary = makePrimary()
+    setPrimaryGateway(primary as never, 'default')
+    setPrimaryGatewayConnection({ connectionId: 'local', mode: 'local' })
+
+    const getConnectionFor = vi.fn(async ({ connectionId, profile }) => ({
+      connectionId,
+      mode: 'local',
+      port: 4242,
+      profile,
+      sharedPrimary: true
+    }))
+
+    ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
+      getConnection: vi.fn(),
+      getConnectionFor
+    }
+
+    expect(await ensureGatewayForAgent('local', 'picasso')).toBe(true)
+    await requestGatewayForAgent('local', 'picasso', 'session.create', { title: 'probe' })
+    expect(await ensureGatewayForAgent('local', 'founder')).toBe(true)
+    await requestGatewayForAgent('local', 'founder', 'session.list', {})
+    expect(await ensureGatewayForAgent('local', 'picasso')).toBe(true)
+
+    expect(secondaryGateways).toHaveLength(0)
+    expect($gateway.get()).toBe(primary)
+    expect(primary.request).toHaveBeenNthCalledWith(1, 'session.create', { title: 'probe', profile: 'picasso' })
+    expect(primary.request).toHaveBeenNthCalledWith(2, 'session.list', { profile: 'founder' })
+  })
+
   function installAttachedSharedRemote() {
     const getConnectionFor = vi.fn(async ({ connectionId, profile }: { connectionId: string; profile: string }) => ({
       connectionId,

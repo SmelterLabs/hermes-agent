@@ -1500,6 +1500,13 @@ export function PreviewPane({
             consoleOpen={consoleOpen}
             devToolsOpen={devtoolsOpen}
             loading={loading}
+            onAutofill={() => {
+              const guestId = webviewRef.current?.getWebContentsId?.()
+
+              if (typeof guestId === 'number') {
+                void window.hermesDesktop?.autofillPreviewFromBitwarden?.(guestId)
+              }
+            }}
             onBack={goBack}
             onClose={onClose}
             onFlushComments={() => void flushComments()}

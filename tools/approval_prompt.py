@@ -287,15 +287,19 @@ def _consent(choice, unresolved: str) -> str:
 def request_elicitation_consent(message: str, description: str, *,
                                 timeout_seconds: int | None = None,
                                 surface: str = "mcp-elicitation", title: str = "Confirm this action?") -> str:
-    """Route an MCP elicitation request to the surface owning the active session:
-    gateway sessions through ``_await_gateway_decision``, CLI/TUI through
-    ``prompt_dangerous_approval``. Always fails closed: a missing notify_cb in a
-    gateway session, timeouts, and exceptions map to ``"decline"`` so a server
-    treats them as "user did not approve" rather than retrying or hanging.
-    Returns ``"accept" | "decline" | "cancel"``."""
+    """Request one-operation consent through the active approval surface.
+
+    API runs use the exact server-issued lease-backed listener and emit the same
+    correlated approval event as terminal/file/execute gates. API, webhook, and
+    msgraph sessions never fall through to ``input()`` when that listener is absent.
+    Ordinary gateway and CLI behavior remains unchanged. A gateway prompt that is
+    withdrawn before the user answers returns ``"cancel"`` rather than a refusal.
+    Returns ``"accept" | "decline" | "cancel"``.
+    """
     from tools import approval as _a
     try:
         session_key = _ctx.get_current_session_key()
+        session_platform = _ctx._get_session_platform()
     except Exception as exc:  # pragma: no cover -- defensive
         logger.warning("Elicitation consent: session lookup failed: %s", exc)
         return "decline"
@@ -304,26 +308,26 @@ def request_elicitation_consent(message: str, description: str, *,
     if _ctx._is_single_query_approval_context():
         return "decline"
 
-    # api_server is an unattended *platform* for the dangerous-command gate, but a live ``/v1/runs`` run
-    # registers an approval notify callback and answers via ``POST /v1/runs/{id}/approval``
-    # (gateway/platforms/api_server_runs.py), so its per-call MCP consent takes the gateway path too.
-    # A run without a callback still fails closed below; cron and ``-q`` workers stay excluded.
-    api_run_context = (
-        _ctx._get_session_platform() == "api_server"
-        and not _ctx._is_cron_approval_context()
-        and not _ctx._is_single_query_approval_context()
-    )
-    if _ctx._is_gateway_approval_context() or api_run_context:
-        notify_cb = _a._gateway_notify_cb(session_key)
-        if notify_cb is None:
-            logger.warning("Elicitation requested in gateway session %s but no "
-                           "notify_cb is registered — failing closed", session_key)
-            return "decline"
+    # The shared helper is capability-aware for every platform. A non-None lease
+    # means the event belongs to an API execution and is never persisted.
+    current_lease = _ctx.get_current_api_server_run_lease()
+    listener = _a.get_current_gateway_approval_listener()
+    gateway_context = _ctx._is_gateway_approval_context()
+    unattended_worker = _ctx._is_cron_approval_context() or _ctx._is_single_query_approval_context()
+    if listener is not None and (
+        listener[1] is not None or (gateway_context and not unattended_worker)
+    ):
+        notify_cb, lease = listener
         try:
             decision = _gw._await_gateway_decision(
-                session_key, notify_cb, {"command": message, "description": description,
-                                         "pattern_key": "mcp_elicitation",
-                                         "pattern_keys": ["mcp_elicitation"]}, surface=surface)
+                session_key, notify_cb,
+                {"command": message, "description": description,
+                 "pattern_key": "mcp_elicitation",
+                 "pattern_keys": ["mcp_elicitation"],
+                 "allow_permanent": False, "allow_session": False},
+                surface=surface, api_server_capability=lease,
+                require_api_server_capability=lease is not None,
+            )
         except Exception as exc:
             logger.error("Elicitation gateway dispatch failed: %s", exc, exc_info=True)
             return "decline"
@@ -332,6 +336,21 @@ def request_elicitation_consent(message: str, description: str, *,
         if not decision.get("resolved") or decision.get("cancelled"):
             return "cancel"  # nobody answered (timeout / prompt withdrawn) — not a user refusal
         return _consent(decision.get("choice"), "decline")
+
+    # A copied lease can outlive its listener and platform binding. It is still an
+    # execution-owned context, so never fall through to stdin after revocation.
+    if listener is None and current_lease is not None:
+        logger.warning("Elicitation requested with a stale/unregistered API approval lease — declining")
+        return "decline"
+    if session_platform in {"api_server", "webhook", "msgraph_webhook"}:
+        logger.warning(
+            "Elicitation requested on unattended platform %s without a live approval listener — declining",
+            session_platform or "unknown",
+        )
+        return "decline"
+    if _ctx._is_gateway_approval_context():
+        logger.warning("Elicitation requested in gateway session %s but no listener is registered", session_key)
+        return "decline"
 
     # Nobody can answer a -q, cron or unattended-platform worker. A `hermes chat -q` turn still has the CLI's
     # panel callback registered, which would wait the full approval timeout before failing closed.
@@ -350,7 +369,7 @@ def request_elicitation_consent(message: str, description: str, *,
         # allow_permanent=False: elicitation is a per-call confirmation — no pattern to remember.
         # Pass the agent thread's panel callback: without it prompt_toolkit fails the prompt closed unseen.
         choice = prompt_dangerous_approval(message, description, timeout_seconds=timeout_seconds,
-                                           allow_permanent=False, title=title,
+                                           allow_permanent=False, allow_session=False, title=title,
                                            approval_callback=_get_approval_callback())
         hook_choice = choice
     except Exception as exc:

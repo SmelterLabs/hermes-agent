@@ -1,6 +1,7 @@
 import type { AppendMessage } from '@assistant-ui/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { SESSION_RESUME_REQUEST_TIMEOUT_MS } from '@/api/client'
 import type { ChatMessage } from '@/lib/chat-messages'
 
 import {
@@ -219,7 +220,8 @@ describe('withSessionNotFoundResume', () => {
 
     expect(d.requestGateway).toHaveBeenCalledWith(
       'session.resume',
-      expect.objectContaining({ session_id: STORED, source: 'desktop', omit_messages: true, profile: 'work' })
+      expect.objectContaining({ session_id: STORED, source: 'desktop', omit_messages: true, profile: 'work' }),
+      SESSION_RESUME_REQUEST_TIMEOUT_MS
     )
   })
 

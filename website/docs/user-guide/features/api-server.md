@@ -720,6 +720,63 @@ External UIs can manage Hermes sessions over REST without standing up the dashbo
 
 `/v1/capabilities` advertises the full surface via `session_*` feature flags and `endpoints.session_*` entries so external UIs can detect support and fall back safely. Inline images are supported in `chat` and `chat/stream` payloads (multimodal-aware path).
 
+### Persisted session working directory (`cwd`)
+
+`POST /api/sessions` accepts an optional absolute `cwd`. It is validated at
+creation (must be an existing absolute directory; relative, missing, or
+non-string values are rejected with `invalid_session_cwd`), persisted on the
+session row, and returned in the session resource so callers can verify the
+binding. Every `/chat` and `/chat/stream` turn on that session then binds the
+stored cwd for the whole agent run through the task-local session-context
+variables — the system prompt, `AGENTS.md` context-file discovery, terminal
+tool, and relative file operations all resolve inside it, and concurrent API
+sessions keep fully independent bindings. If the stored directory later
+disappears, chat turns fail closed with a `503 session_cwd_unavailable` error
+instead of silently running in the process's default directory.
+
+Operators can optionally restrict which directories API clients may bind by
+listing allowed roots in the platform config
+(`platforms.api_server.extra.session_cwd_roots: ["/abs/path", ...]`); with the
+list set, a `cwd` outside every root is rejected at creation.
+
+```bash
+# create a session bound to a project workspace
+curl -X POST http://localhost:8642/api/sessions \
+  -H "Authorization: Bearer $API_SERVER_KEY" \
+  -d '{"title": "My Project Session", "cwd": "/home/user/projects/my-app"}'
+```
+
+### Pinned warm sessions
+
+External always-on hosts (for example a telephony or webhook bridge that
+drives one durable conversation) can pin sessions by exact title so their
+agent runtime stays **warm**:
+
+```yaml
+# config.yaml
+gateway:
+  platforms:
+    api_server:
+      pinned_sessions:
+        - "My Bridge Session"
+```
+
+A pinned session's agent is hydrated when the gateway starts (and again on
+every reconnect), reused across `/api/sessions/{id}/chat` and `/chat/stream`
+turns instead of being rebuilt per request, and rebuilt automatically exactly
+once after a failed turn or a persisted model-lock change. Turns on one pin
+are serialized; distinct pins run concurrently.
+
+`GET /api/pinned-sessions` (API-key gated) reports separate readiness facts
+per pin — `session_persisted`, `cwd_bound`, `context_hydrated`, `tools_ready`,
+`memory_ready`, `model_lock_confirmed`, and `provider_auth_valid` — plus
+hydration/turn timestamps. `provider_auth_valid` reflects a **real bounded
+request** through the pinned provider/model (resolved through the normal
+credential chain, so ordinary token refresh is exercised); only status,
+latency, identity, and error class are recorded. Pass `?probe_auth=1` to force
+a fresh probe (rate-limited). The facts are never collapsed into a single
+boolean, so monitors can tell "session missing" from "auth expired".
+
 ```bash
 # fork a session and run one turn
 curl -X POST http://localhost:8642/api/sessions/$ID/fork \

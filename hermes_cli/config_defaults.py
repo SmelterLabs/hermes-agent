@@ -453,6 +453,8 @@ DEFAULT_CONFIG = {
         # Windows browser holding its cookies) gives a fresh, signed-out browser plus a note saying why.
         # Also gates the browser_exec `local` arg (real-profile session under a cloud backend). Desktop Settings -> Browser.
         "use_real_profile": False,
+        # Source Chromium browser for the consented snapshot; default follows the OS.
+        "real_profile_browser": "default",
         # Windows only: a running Chrome/Edge/Brave locks its cookie DB, so the profile can't be
         # copied (the session runs on a fresh browser). When on, the agent ASKS first; on approval it
         # runs `hermes browser close-profile` (kills that profile's browser tree, unsaved tabs lost)
@@ -1242,6 +1244,9 @@ DEFAULT_CONFIG = {
         "barge_in_grace_seconds": 0.5,
         # Speech trigger = quiet-room floor x this (floor calibrated BEFORE playback).
         "barge_in_threshold_multiplier": 3.0,
+        # Desktop playback floor and VAD sensitivity retained from the accepted voice tuning.
+        "barge_in_playback_floor": 0.14,
+        "barge_in_playback_multiplier": 3.0,
         # Saying EXACTLY one of these (case-insensitive, punctuation ignored) ends the voice chat
         # instead of going to the agent. [] disables.
         "stop_phrases": ["stop"],

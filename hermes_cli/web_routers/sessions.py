@@ -16,7 +16,7 @@ from typing import Callable, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from hermes_cli.session_listing import subagent_listing_scope
 from hermes_cli.web_deps import late
@@ -764,23 +764,31 @@ async def get_session_messages(
             sid, limit=_limit, offset=offset, latest=latest_page,
             include_compacted=include_compacted, include_ancestors=True)
 
-    result = await asyncio.to_thread(_with_db, profile, _read, read_only=True)
-    if result is None:
+    def _read_project_render():
+        result = _with_db(profile, _read, read_only=True)
+        if result is None:
+            return None
+        sid, _limit, messages = result
+        projected_messages = _project_for_display(
+            messages, home=_history_profile_home(profile), inline_images=inline_images)
+        payload = {
+            "session_id": sid,
+            # The same stamp list rows carry, so the Desktop keys a page under the
+            # owner it already routes the session by.
+            "profile": _serving_profile(profile),
+            "messages": projected_messages,
+            "pagination": {
+                "limit": _limit, "offset": offset,
+                "order": order or ("latest" if limit is None else "oldest"),
+                "returned": len(projected_messages)}}
+        # Include conversion and encoding in the worker: returning a dict would
+        # move those potentially large passes back onto the ASGI event loop.
+        return JSONResponse(content=jsonable_encoder(payload))
+
+    rendered = await asyncio.to_thread(_read_project_render)
+    if rendered is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
-    sid, _limit, messages = result
-    projected_messages = await asyncio.to_thread(
-        _project_for_display, messages, home=_history_profile_home(profile),
-        inline_images=inline_images)
-    return {
-        "session_id": sid,
-        # The same stamp list rows carry, so the Desktop keys a page under the
-        # owner it already routes the session by.
-        "profile": _serving_profile(profile),
-        "messages": projected_messages,
-        "pagination": {
-            "limit": _limit, "offset": offset,
-            "order": order or ("latest" if limit is None else "oldest"),
-            "returned": len(projected_messages)}}
+    return rendered
 
 
 def _timeline_session_id(db, session_id: str, owner: str) -> str:

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -52,6 +53,10 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     return app
+
+
+def _reject_nonfinite_json(value):
+    raise ValueError(f"non-finite JSON number in API response: {value}")
 
 
 @pytest.mark.asyncio
@@ -282,6 +287,65 @@ async def test_fork_session_writes_branched_from_marker(adapter, session_db):
     if isinstance(cfg, str):
         cfg = json.loads(cfg)
     assert cfg["_branched_from"] == source_id
+
+
+@pytest.mark.asyncio
+async def test_session_messages_serializes_proactive_event_marker(adapter, session_db):
+    session_id = session_db.ensure_proactive_session()
+    metadata = {"source": "proactive-monitor", "severity": "info"}
+    row_id = session_db.append_assistant_message_idempotent(
+        session_id,
+        "new proactive update",
+        "api-event",
+        display_kind="event",
+        display_metadata=metadata,
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.get(f"/api/sessions/{session_id}/messages")
+        assert response.status == 200
+        payload = await response.json()
+
+    assert len(payload["data"]) == 1
+    message = payload["data"][0]
+    assert message["id"] == row_id
+    assert message["session_id"] == session_id
+    assert message["role"] == "assistant"
+    assert message["content"] == "new proactive update"
+    assert message["display_kind"] == "event"
+    assert message["display_metadata"] == metadata
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nonfinite", [math.nan, math.inf, -math.inf])
+async def test_session_messages_remains_strict_json_when_metadata_is_nonfinite(
+    adapter, session_db, nonfinite
+):
+    session_id = session_db.ensure_proactive_session()
+    row_id = session_db.append_assistant_message_idempotent(
+        session_id,
+        "strict JSON survives invalid presentation metadata",
+        f"api-nonfinite-{nonfinite!r}",
+        display_kind="event",
+        display_metadata={"source": "monitor", "value": nonfinite},
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.get(f"/api/sessions/{session_id}/messages")
+        assert response.status == 200
+        payload = json.loads(
+            await response.text(),
+            parse_constant=_reject_nonfinite_json,
+        )
+
+    message = payload["data"][0]
+    assert message["id"] == row_id
+    assert message["content"] == "strict JSON survives invalid presentation metadata"
+    assert message["display_kind"] == "event"
+    assert message["display_metadata"] is None
+
 
 @pytest.mark.asyncio
 async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeypatch):

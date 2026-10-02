@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 
 from hermes_cli.session_listing import subagent_listing_scope
 from hermes_cli.web_deps import late
@@ -511,7 +513,24 @@ def get_profiles_sessions(
             "storage": _corrupt_profile_stores(targets)}
 
 
+def _offloop_json_response(payload) -> JSONResponse:
+    # A dict return makes FastAPI convert and encode on the event loop even
+    # for a sync route. Build the response in the route's worker instead;
+    # large sidebar/tree payloads must not starve WebSocket traffic.
+    return JSONResponse(content=jsonable_encoder(payload))
+
+
 @sessions_router.get("/api/profiles/sessions/sidebar")
+def get_profiles_sessions_sidebar_route(
+    recents_profile: str = "all", recents_limit: int = 20, recents_exclude: str = None,
+    cron_limit: int = 50, messaging_limit: int = 100, messaging_exclude: str = None,
+):
+    return _offloop_json_response(get_profiles_sessions_sidebar(
+        recents_profile=recents_profile, recents_limit=recents_limit,
+        recents_exclude=recents_exclude, cron_limit=cron_limit,
+        messaging_limit=messaging_limit, messaging_exclude=messaging_exclude))
+
+
 @_sidebar_singleflight_cache
 def get_profiles_sessions_sidebar(
     recents_profile: str = "all", recents_limit: int = 20, recents_exclude: str | None = None,
@@ -664,12 +683,20 @@ def _merge_by_id(into: dict[str, dict[str, Any]], entries: list[dict[str, Any]],
 
 def _merge_profile_tree(
     merged: dict[str, dict[str, Any]], projects: list[dict[str, Any]], profile: str,
-    preview_limit: int) -> None:
+    preview_limit: int, default_cwd: Optional[str] = None) -> None:
     """Fold one profile's projects into the shared tree, keyed by folder: the same checkout
     in two profiles is one group, as is ``__no_project__`` (else one "Home" per profile), and
     a declared project (``p_<hash>``) folds with another profile's auto entry for the same
-    folder. Sessions carry the owning profile; a group header never claims a single owner."""
+    folder. Sessions carry the owning profile; defaultProfile is only a launch hint
+    from the profile whose configured cwd matches this folder, not session ownership."""
+    default_path = Path(default_cwd).expanduser().resolve(strict=False) if default_cwd else None
     for project in projects:
+        if default_path is not None and project.get("path"):
+            try:
+                if Path(project["path"]).expanduser().resolve(strict=False) == default_path:
+                    project["defaultProfile"] = profile
+            except (OSError, RuntimeError):
+                pass
         lane_sessions = (s for r in project.get("repos") or []
                          for lane in r.get("groups") or []
                          for s in lane.get("sessions") or [])
@@ -695,6 +722,8 @@ def _merge_profile_tree(
             existing, project = project, existing
             merged[key] = existing
 
+        if project.get("defaultProfile") and not existing.get("defaultProfile"):
+            existing["defaultProfile"] = project["defaultProfile"]
         repos: dict[str, dict[str, Any]] = {r["id"]: r for r in existing.get("repos") or []}
         _merge_by_id(repos, project.get("repos") or [], "groups")
         existing["repos"] = list(repos.values())
@@ -707,6 +736,11 @@ def _merge_profile_tree(
 
 
 @sessions_router.get("/api/profiles/projects/tree")
+def get_profiles_projects_tree_route(preview_limit: int = 3, session_limit: int = 2000):
+    return _offloop_json_response(get_profiles_projects_tree(
+        preview_limit=preview_limit, session_limit=session_limit))
+
+
 @_sidebar_singleflight_cache
 def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000, profile: Optional[str] = None):
     """Project tree for every profile at once, for the all-profiles sidebar.
@@ -729,10 +763,13 @@ def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000
     for name, home in _scoped_profile_targets("GET /api/profiles/projects/tree", profile):
         def _read(db, name=name, home=home):
             with _hermes_home_scope(home):
+                from hermes_cli.config import load_config
+                terminal_config = load_config().get("terminal") or {}
+                default_cwd = str(terminal_config.get("cwd") or "").strip()
                 tree, _active_id = gateway_server._build_project_tree(
                     db, preview_limit=preview_limit, hydrate=False,
                     session_limit=session_limit, include_discovered=False)
-                _merge_profile_tree(merged, tree["projects"], name, preview_limit)
+                _merge_profile_tree(merged, tree["projects"], name, preview_limit, default_cwd)
                 scoped_session_ids.extend(tree["scoped_session_ids"])
         _read_profile_db(name, home, errors, _read)
 

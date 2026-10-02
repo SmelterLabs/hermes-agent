@@ -10,7 +10,7 @@ import time
 import uuid
 from collections import deque
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
@@ -235,7 +235,8 @@ def _initialize_run_state(self, *, store_factory) -> None:
     (
         self._run_owners, self._run_streams, self._run_streams_created, self._active_run_agents,
         self._active_run_tasks, self._run_statuses, self._run_approval_sessions,
-    ) = ({} for _ in range(7))
+        self._run_approval_leases,
+    ) = ({} for _ in range(8))
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
@@ -257,6 +258,23 @@ def _idempotency_capabilities(self, *, store_type) -> dict[str, Any]:
 
 
 def _close_run_state(self) -> None:
+    # Adapter shutdown is a revocation boundary too: executor threads may
+    # outlive the HTTP site briefly, but no approval listener may survive the
+    # server that issued its lease.
+    try:
+        from tools.approval import revoke_api_run_approval_lease
+        leases = list(getattr(self, "_run_approval_leases", {}).values())
+        failed = False
+        for lease in leases:
+            try:
+                revoke_api_run_approval_lease(lease)
+            except Exception:
+                failed = True
+                logger.exception("Failed to revoke one API approval lease for %s", self.name)
+        if not failed:
+            getattr(self, "_run_approval_leases", {}).clear()
+    except Exception:
+        logger.exception("Failed to revoke API approval leases for %s", self.name)
     try:
         if getattr(self, "_run_idempotency_store", None) is not None:
             self._run_idempotency_store.close()
@@ -525,6 +543,18 @@ class _RunLaunch:
     browser_control_transport_family: Any
     turn_author: Optional[dict[str, Any]] = None  # memory-attribution label only; grants nothing
     admission: Any = None
+    # Server-issued, per-run lease used to bind and tear down the approval listener.
+    # It never comes from request data and is not a routing/session key.
+    approval_lease: object | None = field(default=None, repr=False)
+    # The outer asyncio task and executor thread race during cancellation; serialize
+    # the register/check with teardown so a late worker cannot recreate a listener.
+    approval_registration_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    approval_cancelled: bool = field(default=False, repr=False)
+
+    @property
+    def approval_capability(self):
+        """Compatibility view; the value is now a revocable server-issued lease."""
+        return self.approval_lease
 
     @property
     def approval_session_key(self) -> str:
@@ -544,10 +574,44 @@ def _forget_run(self, run_id: str, *tables) -> None:
     self._release_run_owner_if_forgotten(run_id)
 
 
-def _retire_live_run(self, run_id: str) -> None:
-    """Retire agent/task/approval control state once the executor-backed task is done."""
-    _forget_run(self, run_id, self._active_run_agents, self._active_run_tasks, self._run_approval_sessions,
-                self._stopping_run_ids, self._shutdown_interrupted_run_ids)
+def _retire_live_run(self, run_id: str) -> bool:
+    """Revoke the run lease before retiring its approval/control state.
+
+    The sweeper may arrive after transport expiry but before a normal executor
+    finalizer. Retirement is refused when approval state cannot be proven gone,
+    so it cannot drop the run record and leave an ownerless callback behind.
+    """
+    lease = self._run_approval_leases.get(run_id)
+    if lease is not None:
+        try:
+            from tools.approval import (
+                is_api_run_approval_lease_active, revoke_api_run_approval_lease,
+            )
+            revoked = revoke_api_run_approval_lease(lease)
+        except Exception:
+            logger.exception("[api_server] failed to revoke approval lease for run %s", run_id)
+            return False
+        if not revoked and is_api_run_approval_lease_active(lease):
+            logger.warning("[api_server] refusing to retire run %s: approval lease is no longer authoritative", run_id)
+            return False
+        # A normal executor finalizer may already have unregistered the
+        # listener, making revoke idempotently return False. In that case the
+        # authoritative registry is empty and the run-owned state can retire.
+        self._run_approval_leases.pop(run_id, None)
+    try:
+        from tools.approval import has_gateway_notify
+        listener_remaining = has_gateway_notify(run_id)
+    except Exception:
+        logger.exception("[api_server] failed to inspect approval listener for run %s", run_id)
+        return False
+    if listener_remaining:
+        logger.warning("[api_server] refusing to retire run %s while approval state remains", run_id)
+        return False
+    _forget_run(
+        self, run_id, self._active_run_agents, self._active_run_tasks,
+        self._run_approval_sessions, self._run_approval_leases, self._stopping_run_ids,
+        self._shutdown_interrupted_run_ids)
+    return True
 
 
 def _drop_run_transport(self, run_id: str) -> None:
@@ -813,6 +877,19 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
         turn_author=turn_author)
+    # The lease is minted by the API server, bound to this launch object, and
+    # reserved before the executor can register a callback. A request/session key
+    # alone is never sufficient authority.
+    from tools.approval import issue_api_server_run_approval_lease
+    launch.approval_lease = issue_api_server_run_approval_lease(run_id, owner=launch)
+    if launch.approval_lease is None:
+        _forget_run(
+            self, run_id, self._run_streams, self._run_streams_created, self._run_approval_sessions,
+            self._run_statuses, self._run_owners, self._run_idempotency_ids)
+        return _json_error(
+            _openai_error, "Could not reserve an approval lease for this run",
+            code="approval_unavailable", status=503)
+    self._run_approval_leases[run_id] = launch.approval_lease
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
     # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
     # receipt drives this run's status, so `peer run` keeps its run_id and `peer status` still works.
@@ -872,7 +949,10 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
     # held by a live transport are never reaped, so with the desktop app open for days those fleets
     # accumulate until the OS refuses new process spawns.
     from tools.approval import register_gateway_notify, unregister_gateway_notify
-    from tools.approval_context import reset_current_session_key, set_current_session_key
+    from tools.approval_context import (
+        reset_current_api_server_run_lease, reset_current_session_key,
+        set_current_api_server_run_lease, set_current_session_key,
+    )
     session_id = run.session_id
     effective_task_id = session_id or run.run_id
     # (token, reset) pairs unwound in the finally block; bound only once each step succeeds.
@@ -881,6 +961,8 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
         try:
             # Contextvars, not process env: concurrent runs must not share identity.
             resets.append((set_current_session_key(run.approval_session_key), reset_current_session_key))
+            resets.append((set_current_api_server_run_lease(run.approval_lease),
+                           reset_current_api_server_run_lease))
             # chat_id carries the raw session id like _run_agent() does; without it
             # tools.async_delegation sees no HERMES_SESSION_CHAT_ID and forces delegations sync.
             session_tokens = self._bind_api_server_session(
@@ -903,7 +985,15 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             if run.agent_kwargs["room_dispatch"] is not None:
                 policy = RoomExecutionPolicy.from_mapping(run.agent_kwargs["room_execution_policy"] or {})
                 resets.append((bind_room_execution_policy(policy), reset_room_execution_policy))
-            register_gateway_notify(run.approval_session_key, approval_notify)
+            with run.approval_registration_lock:
+                if run.approval_cancelled or run.approval_lease is None:
+                    return {"interrupted": True}, {}
+                registered = register_gateway_notify(
+                    run.approval_session_key, approval_notify, capability=run.approval_lease)
+                if registered is False:
+                    # Revocation won the registration race. Never run an API turn
+                    # without its exact listener lease.
+                    return {"interrupted": True}, {}
             # /v1/runs owns its agent lifecycle (no TurnRunner): record process ownership
             # so stop/cancel reaps only the background processes this run created.
             _api_server._publish_turn_process_ownership(agent, effective_task_id)
@@ -912,6 +1002,8 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             r = agent.run_conversation(
                 user_message=run.user_message, conversation_history=run.conversation_history,
                 task_id=effective_task_id, **author_kwargs)
+            _api_server._maybe_post_turn_compress(
+                agent, r, getattr(agent, "session_id", None) or session_id)
         finally:
             # Clear ownership now so a later stop can't reap work this run left running.
             _api_server._clear_turn_process_ownership(agent)
@@ -921,7 +1013,9 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 self._bind_declared_conversation(
                     getattr(agent, "session_id", None) or session_id, run.gateway_session_key)
             try:
-                unregister_gateway_notify(run.approval_session_key)
+                with run.approval_registration_lock:
+                    unregister_gateway_notify(
+                        run.approval_session_key, capability=run.approval_lease)
             finally:
                 for token, reset in resets:
                     with suppress(Exception):
@@ -1097,6 +1191,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                               else "raw_request" if any(requested.values()) else "global"))
             _finish(status, fields, output=result.get("final_response", ""), usage=usage, runtime=served_runtime)
     except asyncio.CancelledError:
+        with run.approval_registration_lock:
+            run.approval_cancelled = True
         _finish("cancelled")
         raise
     except _api_server._ProviderAuthResolutionError as exc:
@@ -1116,25 +1212,27 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     finally:
         # On cancellation (/stop) the executor thread may still block on an approval
         # Event; unregistering releases it. Idempotent on normal completion.
-        _unregister_approval_notify(run.approval_session_key)
+        with run.approval_registration_lock:
+            _unregister_approval_notify(
+                run.approval_session_key, capability=run.approval_lease)
         with suppress(Exception):
             loop.call_soon(run.put_event, None)  # close after the queued events
         _retire_live_run(self, run_id)
 
 
-def _unregister_approval_notify(approval_session_key: Optional[str]) -> None:
+def _unregister_approval_notify(approval_session_key: Optional[str], *, capability=None) -> None:
     """Best-effort release of a run's approval waiter (no-op without a key)."""
     with suppress(Exception):
         from tools.approval import unregister_gateway_notify
         if approval_session_key:
-            unregister_gateway_notify(approval_session_key)
+            unregister_gateway_notify(approval_session_key, capability=capability)
 
 
 def _release_run_owner_if_forgotten(self, run_id: str) -> None:
     """Drop the owner stamp only once nothing keyed by *run_id* survives: ownership must
     outlive every surface it protects (retired on different clocks); ownerless = fail-closed."""
     live = (self._run_statuses, self._active_run_agents, self._active_run_tasks, self._run_streams,
-            self._run_approval_sessions)
+            self._run_approval_sessions, self._run_approval_leases)
     if not any(run_id in table for table in live):
         self._run_owners.pop(run_id, None)
 
@@ -1308,8 +1406,9 @@ async def _handle_run_approval(self, request: web.Request, *, _api_server) -> we
     room_scoped = bool(self._room_grant_token(request))
     raw_request_id = body.get("request_id")
     request_id = raw_request_id.strip() if isinstance(raw_request_id, str) else ""
-    # Room grants may resolve exactly one request and never widen to session/always.
-    allowed = {"once", "deny"} if room_scoped else {"once", "session", "always", "deny"}
+    # API-run leases are execution-scoped. Every approval event is one-shot,
+    # including terminal/execute gates; session/always would outlive the lease.
+    allowed = {"once", "deny"}
     resolve_all = any(_api_server._coerce_request_bool(body.get(k), default=False) for k in ("all", "resolve_all"))
     approval_session_key = self._run_approval_sessions.get(run_id)
     for failed, message, code, status in (
@@ -1494,14 +1593,25 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
         stream = self._run_streams.get(run_id)
         if now - created_at <= self._RUN_STREAM_TTL or (stream is not None and stream.subscribers):
             continue
-        logger.debug("[api_server] sweeping expired run transport %s", run_id)
         task = self._active_run_tasks.get(run_id)
+        if task is not None and not task.done():
+            # Still executing: keep the backlog (bounded by count, not age) so a subscriber
+            # can reattach at any point of the run, however long the phone stayed locked.
+            continue
+        logger.debug("[api_server] sweeping expired run transport %s", run_id)
         # Transport TTL bounds buffering; live control state survives until the task returns.
         _drop_run_transport(self, run_id)
         if task is None or task.done():
-            _unregister_approval_notify(self._run_approval_sessions.get(run_id))
+            # Carry the owning lease into orphan teardown. Unscoped cleanup cannot
+            # remove an API-owned listener, so retire only after atomic lease revoke.
             _retire_live_run(self, run_id)
     for run_id, status in list(self._run_statuses.items()):
         if (status.get("status") in {"completed", "failed", "cancelled"}
                 and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL):
-            _forget_run(self, run_id, self._run_statuses, self._run_idempotency_ids)
+            # Terminal retention cleanup is another orphan path. Do not discard
+            # the status/owner until the lease-backed listener teardown succeeds.
+            task = self._active_run_tasks.get(run_id)
+            if task is not None and not task.done():
+                continue
+            if _retire_live_run(self, run_id):
+                _forget_run(self, run_id, self._run_statuses, self._run_idempotency_ids)

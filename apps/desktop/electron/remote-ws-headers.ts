@@ -7,6 +7,7 @@ export interface RegistryGatewayWsConnection {
   wsUrl: string
   headers?: Record<string, string>
   profile?: null | string
+  sharedPrimary?: boolean
   sharedRemote?: boolean
 }
 

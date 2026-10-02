@@ -358,16 +358,45 @@ def _unhealable_reason(co: _Checkout, branch: str) -> Optional[str]:
     return "unmerged"  # Unknown merge state keeps the branch.
 
 
-def _behind_count(co: _Checkout, target: str) -> tuple[int, list[dict]]:
+def _compare_ahead(current: str, target: str, repository: str) -> tuple[Optional[int], list[dict]]:
+    """``(ahead_by, commits)`` from the GitHub compare API; ``(None, [])`` when it can't answer."""
+    payload = _github_compare(current, target, repository)
+    ahead = (payload or {}).get("ahead_by")
+    if isinstance(ahead, int) and not isinstance(ahead, bool) and ahead >= 0:
+        return ahead, (_quiet(lambda: _commits(payload), []) if ahead else [])
+    return None, []
+
+
+def _local_upstream_base(co: _Checkout, branch: str) -> Optional[str]:
+    """Merge-base of HEAD and the local ``origin/<branch>`` ref, when it resolves to a full SHA."""
+    if co.embedded or not co.head:
+        return None
+    base = _git_stdout(["merge-base", "HEAD", f"origin/{branch}"], cwd=co.root, git=co.git)
+    return base if _is_full_sha(base) else None
+
+
+def _behind_count(co: _Checkout, target: str, *, branch: str = "main") -> tuple[int, list[dict]]:
     """``(behind, commits)`` for ``target``: local ancestry first, then the GitHub compare API."""
     if co.head == target or (not co.embedded and _git_ok(
             ["merge-base", "--is-ancestor", target, co.head], cwd=co.root, git=co.git)):
         return 0, []
     if co.repository:
-        payload = _github_compare(co.head, target, co.repository)
-        ahead = (payload or {}).get("ahead_by")
-        if isinstance(ahead, int) and not isinstance(ahead, bool) and ahead >= 0:
-            return ahead, (_quiet(lambda: _commits(payload), []) if ahead else [])
+        ahead, commits = _compare_ahead(co.head, target, co.repository)
+        if ahead is not None:
+            return ahead, commits
+        # A HEAD carrying local commits on top of ``origin/<branch>`` (an overlay branch rebased
+        # onto upstream) exists nowhere upstream, so compare 404s for it FOREVER -- every update
+        # re-creates a local-only HEAD, so the no-count sentinel below would become permanent.
+        # Its merge-base with the remote-tracking ref IS an upstream commit, and every upstream
+        # commit newer than that base is exactly what this checkout lacks; the local commits
+        # above the base are ours, not missing. So count ``base...target``. Still no ``git fetch``.
+        base = _local_upstream_base(co, branch)
+        if base and base != co.head:
+            if base == target:
+                return 0, []
+            ahead, commits = _compare_ahead(base, target, co.repository)
+            if ahead is not None:
+                return ahead, commits
     return UPDATE_AVAILABLE_NO_COUNT, []
 
 
@@ -394,7 +423,7 @@ def _check_branch(result: dict, co: _Checkout, selected_branch: str, *,
                       message=f"Could not resolve the remote branch tip: {failure}" if failure
                       else "Could not resolve the remote branch tip.")
         return
-    behind, commits = _behind_count(co, target)
+    behind, commits = _behind_count(co, target, branch=result["branch"])
     result["commits"] = commits
     result.update(targetSha=target, behind=behind, updateAvailable=behind != 0)
 

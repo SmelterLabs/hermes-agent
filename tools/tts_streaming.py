@@ -422,6 +422,31 @@ class XAIStreamer(StreamingTTSProvider):
         except Exception:
             return False
 
+    def _session_url(self) -> str:
+        """Handshake URL; the optional tuning keys (``optimize_streaming_latency``,
+        ``speed``, ``text_normalization``) ride in the query string beside the required four."""
+        from urllib.parse import urlencode
+
+        from tools.tts_tool_providers import DEFAULT_XAI_LANGUAGE, DEFAULT_XAI_VOICE_ID
+
+        section = self.section or {}
+        params = {
+            "voice": str(section.get("voice_id", DEFAULT_XAI_VOICE_ID)).strip() or DEFAULT_XAI_VOICE_ID,
+            "language": str(section.get("language", DEFAULT_XAI_LANGUAGE)).strip() or DEFAULT_XAI_LANGUAGE,
+            "codec": "pcm",
+            "sample_rate": str(self.sample_rate),
+        }
+        opt = section.get("optimize_streaming_latency")
+        if opt is not None and str(opt).strip():
+            params["optimize_streaming_latency"] = str(opt).strip()
+        speed = section.get("speed")
+        if speed is not None and str(speed).strip() not in ("", "1", "1.0"):
+            params["speed"] = str(speed).strip()
+        if section.get("text_normalization"):
+            params["text_normalization"] = "true"
+        base = str(section.get("streaming_url") or "wss://api.x.ai/v1/tts").strip()
+        return f"{base}{'&' if '?' in base else '?'}{urlencode(params)}"
+
     def stream(self, text: str) -> Iterator[bytes]:
         # The per-sentence byte cap is enforced once, pump-side (``_pump``), before enqueueing.
         yield from self._queued_frames(text)
@@ -478,28 +503,14 @@ class XAIStreamer(StreamingTTSProvider):
         import asyncio
         import base64
         import json as _json
-        from urllib.parse import urlencode
 
         import websockets
 
-        from tools.tts_tool_providers import DEFAULT_XAI_LANGUAGE, DEFAULT_XAI_VOICE_ID
         from tools.xai_http import resolve_xai_http_credentials
         api_key = str(resolve_xai_http_credentials(prefer_api_key=True).get("api_key") or "").strip()
         if not api_key:
             raise RuntimeError("No xAI credentials for streaming TTS")
-        voice = str(self.section.get("voice_id", DEFAULT_XAI_VOICE_ID)).strip() or DEFAULT_XAI_VOICE_ID
-        language = str(self.section.get("language", DEFAULT_XAI_LANGUAGE)).strip() or DEFAULT_XAI_LANGUAGE
-        base = str(
-            self.section.get("streaming_url") or "wss://api.x.ai/v1/tts"
-        ).strip()
-        params = urlencode({
-            "voice": voice,
-            "language": language,
-            "codec": "pcm",
-            "sample_rate": self.sample_rate,
-        })
-        sep = "&" if "?" in base else "?"
-        ws_url = f"{base}{sep}{params}"
+        ws_url = self._session_url()
 
         async with websockets.connect(
             ws_url, additional_headers={"Authorization": f"Bearer {api_key}"}

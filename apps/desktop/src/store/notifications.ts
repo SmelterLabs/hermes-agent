@@ -57,7 +57,22 @@ export interface NotificationInput {
 let notificationCounter = 0
 const timers = new Map<string, number>()
 
+// Casey disabled Desktop toast messages on this PC: the app currently has no
+// user-facing global preference, so gate the single shared dispatch point.
+// Keep this as a toggle rather than scattering per-feature suppressions; every
+// in-app toast flows through notify().
+let toastMessagesEnabled = false
+
 export const $notifications = atom<AppNotification[]>([])
+
+/** Enable or suppress every in-app Desktop toast at the shared dispatch point. */
+export function setToastMessagesEnabled(enabled: boolean) {
+  toastMessagesEnabled = enabled
+
+  if (!enabled) {
+    clearNotifications()
+  }
+}
 
 function defaultDuration(kind: NotificationKind) {
   if (kind === 'error' || kind === 'warning') {
@@ -260,6 +275,10 @@ function showNotification(input: NotificationInput, errorCategory: ErrorToastCat
   }
 
   const id = input.id ?? `${Date.now()}-${notificationCounter++}`
+
+  if (!toastMessagesEnabled) {
+    return id
+  }
 
   const notification: AppNotification = {
     id,

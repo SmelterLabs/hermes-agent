@@ -8,6 +8,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import queue
 import sys
 import threading
@@ -1606,6 +1607,45 @@ def _context_section(content: str, label: str, warn_name: str, path: Path, conte
     return _truncate_content(body, warn_name, context_length=context_length, read_path=str(path))
 
 
+_HERMES_MD_IMPORT_RE = re.compile(r"^@(\S.*?)\s*$")
+
+
+def _expand_hermes_md_imports(content: str, base_dir: Path) -> str:
+    """Expand ``@path`` import lines in HERMES.md, ONE level deep.
+
+    Same line syntax as Claude Code's ``CLAUDE.md`` imports: a line that is
+    exactly ``@<path>`` (relative to the HERMES.md directory, or absolute;
+    ``~`` expands) is replaced by that file's body under a provenance heading,
+    so a project can keep its canon in one place (``CLAUDE.md``, a doctrine
+    file, the global rules) and hand Hermes a guaranteed system-prompt kernel
+    without a copied, drifting mirror. Imports inside the imported files are
+    NOT expanded — they stay as literal ``@`` pointer lines the agent can read
+    on demand — so the kernel's size is bounded by the lines the author wrote
+    here. A missing or unreadable target becomes a visible one-line notice
+    rather than a silent hole. The result is still subject to
+    ``context_file_max_chars``.
+    """
+    out: List[str] = []
+    for line in content.splitlines():
+        match = _HERMES_MD_IMPORT_RE.match(line)
+        if not match:
+            out.append(line)
+            continue
+        target = Path(os.path.expanduser(match.group(1)))
+        if not target.is_absolute():
+            target = base_dir / target
+        try:
+            body = _read_text_with_timeout(target).strip()
+        except Exception as e:
+            logger.warning("HERMES.md import not readable: %s (%s)", target, e)
+            out.append(f"[HERMES.md import missing: {target}]")
+            continue
+        body = _strip_yaml_frontmatter(body)
+        body = _scan_context_content(body, target.name)
+        out.append(f"### Imported: {target.name} ({target})\n\n{body}\n")
+    return "\n".join(out)
+
+
 def _hermes_md_candidates(cwd_path: Path) -> list[tuple[str, Path, str]]:
     """.hermes.md / HERMES.md — nearest match walking up to the git root."""
     path = _find_hermes_md(cwd_path)
@@ -1698,7 +1738,9 @@ def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     """.hermes.md / HERMES.md — nearest match walking up to the git root."""
     for label, path, content in _hermes_md_candidates(cwd_path):
         if content:
-            return _context_section(_strip_yaml_frontmatter(content), label, ".hermes.md", path, context_length)
+            # PC overlay: expand one level of ``@path`` imports (HERMES.md kernel).
+            content = _expand_hermes_md_imports(_strip_yaml_frontmatter(content), path.parent)
+            return _context_section(content, label, ".hermes.md", path, context_length)
     return ""
 
 

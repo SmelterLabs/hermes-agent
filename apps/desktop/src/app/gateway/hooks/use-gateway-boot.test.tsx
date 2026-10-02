@@ -28,7 +28,7 @@ import {
   endGatewaySwitch,
   recoverActiveSourceAfterFailedGatewaySwitch
 } from '@/store/gateway-switch'
-import { $notifications, clearNotifications, notifyError } from '@/store/notifications'
+import { $notifications, clearNotifications, notifyError, setToastMessagesEnabled } from '@/store/notifications'
 import { $activeGatewayProfile, $profiles, ensureGatewayProfile } from '@/store/profile'
 import { $backendRestartRequest } from '@/store/recovery-requests'
 import {
@@ -200,6 +200,8 @@ function Harness({
 const originalWebSocket = globalThis.WebSocket
 
 beforeEach(() => {
+  // This PC ships with toasts suppressed; the suite asserts on them.
+  setToastMessagesEnabled(true)
   // Drop any parked gateway left by a prior file/case (globalThis slot).
   const leftover = takeGatewaySurvivor()
 

@@ -121,22 +121,396 @@ def _denial_breaker_addendum(session_key: str) -> str:
 # instead of only hearing "denied". Ported from qwibitai/nanoclaw#2832.
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+# Compatibility name retained for diagnostics/tests; values are server-issued leases,
+# never caller-created capability objects.
+_gateway_notify_capabilities: dict[str, object] = {}  # session_key → _ApiRunApprovalLease
+# Each callback registration gets a monotonically increasing generation.  The
+# generation is captured before an external callback runs and checked again
+# afterwards, so replacement/revocation cannot turn an old dispatch into a
+# live approval even when the callback itself is slow or re-entrant.
+_gateway_notify_generations: dict[str, int] = {}
+_gateway_notify_generation_counter = 0
 
 
-def register_gateway_notify(session_key: str, cb) -> None:
-    """Register ``cb(approval_data: dict) -> None`` for sending approval requests. The callback
-    bridges sync→async: it runs in the agent thread and must schedule the send on the loop."""
+class _ApiRunApprovalLease:
+    """Opaque, process-local authority for one live API run.
+
+    Possession of the object is not authority by itself: every use is checked against
+    ``_api_run_approval_leases`` under ``_lock``. Revocation removes the exact object
+    from that registry, so a copied ContextVar can never resurrect a listener.
+    """
+
+    __slots__ = ("_session_key", "_owner")
+
+    def __init__(self, session_key: str, owner: object):
+        self._session_key = session_key
+        self._owner = owner
+
+    def __repr__(self) -> str:  # pragma: no cover - defensive log hygiene
+        return "<ApiRunApprovalLease>"
+
+
+# The key reservation and the callback registration are intentionally protected by
+# the same lock. A run's client-controlled key can therefore never be rebound to a
+# different live lease between validation and mutation.
+_api_run_approval_leases: dict[str, _ApiRunApprovalLease] = {}
+
+
+def issue_api_run_approval_lease(session_key: str, owner: object | None = None):
+    """Mint one active approval lease for a server-owned run.
+
+    ``session_key`` is only a routing key; the server-owned *owner* token is bound
+    into the lease as a second identity. The returned object is usable only while
+    this exact key-to-lease binding remains in the active registry. ``None`` means
+    the key is already reserved by another live run or the input is invalid.
+    """
+    session_key = str(session_key or "")
+    if not session_key:
+        return None
+    owner = owner if owner is not None else object()
     with _lock:
+        # Reserve only an uncontended key. An existing ordinary listener or
+        # queue belongs to another surface; replacing it would make the new
+        # API run inherit somebody else's approval state.
+        if (
+            session_key in _api_run_approval_leases
+            or session_key in _gateway_notify_cbs
+            or session_key in _gateway_notify_capabilities
+            or session_key in _gateway_queues
+        ):
+            return None
+        lease = _ApiRunApprovalLease(session_key, owner)
+        _api_run_approval_leases[session_key] = lease
+        return lease
+
+
+def _api_run_approval_lease_matches_locked(session_key: str, lease) -> bool:
+    """Return whether *lease* is the currently active lease for *session_key*.
+
+    Caller holds ``_lock``. Identity comparison is deliberate: equality or a
+    caller-supplied key would make copied/stale authority reusable after revocation.
+    """
+    return (
+        isinstance(lease, _ApiRunApprovalLease)
+        and bool(getattr(lease, "_session_key", ""))
+        and lease._session_key == session_key
+        and _api_run_approval_leases.get(session_key) is lease
+    )
+
+
+def is_api_run_approval_lease_active(lease) -> bool:
+    """Return whether *lease* is still the authoritative live lease."""
+    if not isinstance(lease, _ApiRunApprovalLease):
+        return False
+    with _lock:
+        return _api_run_approval_lease_matches_locked(lease._session_key, lease)
+
+
+def _cancel_gateway_entries_locked(session_key: str, reason: str | None = None) -> list:
+    """Remove and mark a session's queued approvals; caller holds ``_lock``."""
+    entries = _gateway_queues.pop(session_key, [])
+    for entry in entries:
+        # Keep a human-readable withdrawal cause for ordinary gateway waits. API
+        # lease callers still fail closed as ``notify_failed`` before this cause
+        # can authorize anything.
+        entry.cancelled = reason or True
+    return entries
+
+
+def _next_gateway_notify_generation_locked(session_key: str) -> int:
+    """Allocate a registration generation; caller holds ``_lock``."""
+    global _gateway_notify_generation_counter
+    _gateway_notify_generation_counter += 1
+    generation = _gateway_notify_generation_counter
+    _gateway_notify_generations[session_key] = generation
+    return generation
+
+
+def _invalidate_gateway_notify_generation_locked(session_key: str) -> None:
+    """Invalidate the current registration; caller holds ``_lock``."""
+    global _gateway_notify_generation_counter
+    _gateway_notify_generation_counter += 1
+    _gateway_notify_generations.pop(session_key, None)
+
+
+def _gateway_notify_dispatch_snapshot_locked(
+    session_key: str, cb, *, capability=None, require_capability: bool = False,
+):
+    """Capture callback ownership for a two-phase dispatch; caller holds ``_lock``.
+
+    A registered callback is returned with its generation and lease.  A legacy
+    direct callback is allowed only when the session has no registered listener
+    or reserved API lease.  The latter rule prevents a caller with a copied
+    session key from bypassing the exact run-owned listener.
+    """
+    if not callable(cb):
+        return None
+    registered_cb = _gateway_notify_cbs.get(session_key)
+    registered_capability = _gateway_notify_capabilities.get(session_key)
+    if registered_cb is cb:
+        if not _gateway_notify_registration_matches_locked(
+            session_key, cb, capability=capability, require_capability=require_capability,
+        ):
+            return None
+        generation = _gateway_notify_generations.get(session_key)
+        if generation is None:
+            # Defensive compatibility for tests/legacy callers that populated
+            # the callback map directly before generations were introduced.
+            generation = _next_gateway_notify_generation_locked(session_key)
+        return (cb, generation, registered_capability, True)
+    if (
+        require_capability
+        or registered_cb is not None
+        or registered_capability is not None
+        or _api_run_approval_leases.get(session_key) is not None
+    ):
+        return None
+    return (cb, None, None, False)
+
+
+def _gateway_notify_registration_live_locked(
+    session_key: str, snapshot, *, capability=None, require_capability: bool = False,
+) -> bool:
+    """Verify callback ownership after an external dispatch; caller holds lock."""
+    if snapshot is None:
+        return False
+    cb, generation, registered_capability, registered = snapshot
+    if registered:
+        return (
+            _gateway_notify_cbs.get(session_key) is cb
+            and _gateway_notify_generations.get(session_key) == generation
+            and _gateway_notify_capabilities.get(session_key) is registered_capability
+            and _gateway_notify_registration_matches_locked(
+                session_key, cb, capability=capability,
+                require_capability=require_capability,
+            )
+        )
+    # A direct legacy callback is valid only while nobody has installed an
+    # execution-owned or ordinary registered listener for this key.
+    return (
+        _gateway_notify_cbs.get(session_key) is None
+        and _gateway_notify_capabilities_absent_locked(session_key)
+    )
+
+
+def _gateway_notify_capabilities_absent_locked(session_key: str) -> bool:
+    """Small named predicate to keep the direct-callback race check readable."""
+    return (
+        _gateway_notify_capabilities.get(session_key) is None
+        and _api_run_approval_leases.get(session_key) is None
+    )
+
+
+def _gateway_notify_dispatch_live_locked(
+    session_key: str, entry, snapshot, *, capability=None,
+    require_capability: bool = False,
+) -> bool:
+    """Verify callback ownership and queue membership; caller holds ``_lock``."""
+    return (
+        not entry.cancelled
+        and entry in _gateway_queues.get(session_key, [])
+        and _gateway_notify_registration_live_locked(
+            session_key, snapshot, capability=capability,
+            require_capability=require_capability,
+        )
+    )
+
+
+def issue_api_run_approval_lease_for_run(session_key: str, owner: object | None = None):
+    """Explicit server-facing alias for :func:`issue_api_run_approval_lease`."""
+    return issue_api_run_approval_lease(session_key, owner)
+
+
+def issue_api_server_run_approval_lease(session_key: str, owner: object | None = None):
+    """Compatibility alias naming the API server as the lease issuer."""
+    return issue_api_run_approval_lease(session_key, owner)
+
+
+def revoke_api_run_approval_lease(lease, *, owner: object | None = None) -> bool:
+    """Atomically revoke a live lease and tear down its owned listener.
+
+    A stale copy, a lease for another key, or a mismatched owner is a no-op. The
+    callback and all waiters are removed before the active lease binding is retired,
+    so orphan cleanup cannot leave an ownerless approval surface behind.
+    """
+    if not isinstance(lease, _ApiRunApprovalLease):
+        return False
+    with _lock:
+        session_key = lease._session_key
+        if not _api_run_approval_lease_matches_locked(session_key, lease):
+            return False
+        if owner is not None and lease._owner is not owner:
+            return False
+        entries = []
+        if _gateway_notify_capabilities.get(session_key) is lease:
+            _gateway_notify_cbs.pop(session_key, None)
+            _gateway_notify_capabilities.pop(session_key, None)
+            _invalidate_gateway_notify_generation_locked(session_key)
+        else:
+            # The lease can be revoked between registration attempts. There
+            # must still be no queue left under the run key when its authority
+            # is retired.
+            entries = []
+            _invalidate_gateway_notify_generation_locked(session_key)
+        entries.extend(_cancel_gateway_entries_locked(session_key))
+        _api_run_approval_leases.pop(session_key, None)
+    for entry in entries:
+        entry.event.set()
+    return True
+
+
+def revoke_api_server_run_approval_lease(lease, *, owner: object | None = None) -> bool:
+    """Compatibility alias naming the API server's revocation boundary."""
+    return revoke_api_run_approval_lease(lease, owner=owner)
+
+
+def register_gateway_notify(session_key: str, cb, *, capability=None) -> bool:
+    """Register ``cb(approval_data: dict) -> None`` for sending approval requests.
+
+    Ordinary gateway listeners remain unowned. API-run listeners require a lease
+    minted by :func:`issue_api_run_approval_lease`; arbitrary objects, stale copies,
+    and leases for another key are rejected without changing the existing owner.
+    Returns ``True`` only when the registration is accepted.
+    """
+    session_key = str(session_key or "")
+    if not session_key or not callable(cb):
+        return False
+    with _lock:
+        previous_cb = _gateway_notify_cbs.get(session_key)
+        previous_lease = _gateway_notify_capabilities.get(session_key)
+        active_lease = _api_run_approval_leases.get(session_key)
+        if capability is not None:
+            # A capability is valid only when the server's exact key binding is live.
+            if not _api_run_approval_lease_matches_locked(session_key, capability):
+                return False
+            # Never let a second owner replace a live listener. The run itself may
+            # repeat registration idempotently with the same callback/lease.
+            if previous_cb is not None and (
+                previous_cb is not cb or previous_lease is not capability
+            ):
+                return False
+            if previous_lease is not None and previous_lease is not capability:
+                return False
+        else:
+            # An ordinary surface cannot squat on a reserved run key or borrow an
+            # API-owned callback. Existing ordinary registrations retain their old
+            # replacement behavior when no run lease is active.
+            if active_lease is not None or previous_lease is not None:
+                return False
+        same_registration = previous_cb is cb and previous_lease is capability
         _gateway_notify_cbs[session_key] = cb
+        if capability is None:
+            _gateway_notify_capabilities.pop(session_key, None)
+        else:
+            _gateway_notify_capabilities[session_key] = capability
+        if not same_registration:
+            _next_gateway_notify_generation_locked(session_key)
+    return True
 
 
-def unregister_gateway_notify(session_key: str) -> None:
-    """Unregister the callback and wake ALL blocked threads for this session so
-    they don't hang forever (agent run finished or interrupted)."""
+def unregister_gateway_notify(session_key: str, *, capability=None) -> bool:
+    """Unregister a callback only with the authority that owns it.
+
+    Unscoped cleanup can remove ordinary gateway listeners. An API-owned listener
+    requires the exact active lease; stale copies and cross-run cleanup are no-ops.
+    """
+    session_key = str(session_key or "")
+    entries = []
     with _lock:
+        registered_lease = _gateway_notify_capabilities.get(session_key)
+        active_lease = _api_run_approval_leases.get(session_key)
+        if registered_lease is not None:
+            if capability is None or capability is not registered_lease:
+                return False
+            if not _api_run_approval_lease_matches_locked(session_key, capability):
+                return False
+        elif capability is not None:
+            # A capability may not remove an ordinary listener or an empty slot.
+            return False
+        elif active_lease is not None:
+            # The key is reserved even if registration has not happened yet.
+            return False
         _gateway_notify_cbs.pop(session_key, None)
-        for entry in _gateway_queues.pop(session_key, []):
-            entry.event.set()
+        _gateway_notify_capabilities.pop(session_key, None)
+        _invalidate_gateway_notify_generation_locked(session_key)
+        entries = _cancel_gateway_entries_locked(
+            session_key,
+            "the turn ended before the prompt was answered"
+            if registered_lease is None else None,
+        )
+        if registered_lease is not None:
+            # Unregister is the run-finalization boundary for a registered API
+            # listener: invalidate copied ContextVars at the same atomic point.
+            _api_run_approval_leases.pop(session_key, None)
+    for entry in entries:
+        entry.event.set()
+    return True
+
+
+def get_current_gateway_approval_listener() -> tuple[object, object | None] | None:
+    """Return the current context's live listener as ``(callback, lease)``.
+
+    An execution-owned listener is visible only with the exact active lease, not
+    merely a matching session key or an ``api_server`` platform marker. Ordinary
+    gateway listeners remain available only to contexts without a lease. This makes
+    every approval entrypoint use the same capability-aware lookup.
+    """
+    session_key = get_current_session_key(default="")
+    if not session_key:
+        return None
+    current_lease = approval_context.get_current_api_server_run_lease()
+    with _lock:
+        callback = _gateway_notify_cbs.get(session_key)
+        registered_lease = _gateway_notify_capabilities.get(session_key)
+        if not callable(callback):
+            return None
+        if registered_lease is not None:
+            if (
+                current_lease is not registered_lease
+                or not _api_run_approval_lease_matches_locked(session_key, registered_lease)
+            ):
+                return None
+            return callback, registered_lease
+        # A stale/copied lease must not fall through to an ordinary callback that
+        # happens to reuse the old run key. API-server contexts also require the
+        # server-issued lease; an unowned callback is not an API listener.
+        if (
+            current_lease is not None
+            or _api_run_approval_leases.get(session_key) is not None
+            or _get_session_platform() == "api_server"
+        ):
+            return None
+        return callback, None
+
+
+def _gateway_notify_registration_matches_locked(
+    session_key: str, cb, *, capability=None, require_capability: bool = False,
+) -> bool:
+    """Validate callback + lease atomically; caller holds ``_lock``."""
+    if _gateway_notify_cbs.get(session_key) is not cb or not callable(cb):
+        return False
+    registered_lease = _gateway_notify_capabilities.get(session_key)
+    if registered_lease is None:
+        return capability is None and not require_capability
+    return (
+        capability is registered_lease
+        and _api_run_approval_lease_matches_locked(session_key, registered_lease)
+    )
+
+
+def _gateway_notify_registration_matches(
+    session_key: str, cb, *, capability=None, require_capability: bool = False,
+) -> bool:
+    """Public locked wrapper for callback/lease validation."""
+    with _lock:
+        return _gateway_notify_registration_matches_locked(
+            session_key, cb, capability=capability, require_capability=require_capability)
+
+
+def has_gateway_notify(session_key: str) -> bool:
+    """Return whether any callable listener remains registered for a key."""
+    with _lock:
+        return callable(_gateway_notify_cbs.get(session_key))
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
@@ -148,21 +522,32 @@ def resolve_gateway_approval(session_key: str, choice: str,
     *resolve_all* resolves every pending approval (``/approve all``); otherwise the oldest
     (FIFO) or the one matching *request_id*. *reason* is the ``/deny <reason>`` free text,
     relayed to the agent in the BLOCKED message. Returns the number resolved.
+
+    An entry can briefly remain in the queue while its notifier is returning. Keep an
+    early resolution attached to that entry until dispatch completes, rather than popping
+    it before the notifier has a chance to deliver the request.
     """
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
+        available = [entry for entry in queue if not entry.event.is_set() and not entry.cancelled]
         if request_id:
-            targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
+            targets = [entry for entry in available if entry.data.get("request_id") == request_id]
             if not targets:
                 return 0
-            queue[:] = [entry for entry in queue if entry not in targets]
         elif resolve_all:
-            targets = list(queue)
-            queue.clear()
+            targets = available
+            if not targets:
+                return 0
         else:
-            targets = [queue.pop(0)]
+            targets = available[:1]
+
+        # A resolving client may win before the notifier returns. Normal entries can
+        # leave the queue immediately; notify-in-flight entries stay until _await has
+        # completed (or aborted) dispatch and performs the final cleanup.
+        target_set = set(targets)
+        queue[:] = [entry for entry in queue if entry not in target_set or entry.notify_pending]
         if not queue:
             _gateway_queues.pop(session_key, None)
         # Popping the entry and committing its outcome are ONE critical section: the waiter's
@@ -295,11 +680,27 @@ def clear_session(session_key: str) -> None:
         _session_yolo.discard(session_key)
         _launch_yolo_applied.discard(session_key)
         _pending.pop(session_key, None)
-        for entry in _gateway_queues.pop(session_key, []):
-            # Cancel blocked waits now so the old run unwinds instead of idling until timeout;
-            # the prompt was withdrawn, nobody denied it.
-            entry.cancelled = "the session ended before the prompt was answered"
-            entry.event.set()
+        entries = _cancel_gateway_entries_locked(
+            session_key,
+            None
+            if (
+                _api_run_approval_leases.get(session_key) is not None
+                or _gateway_notify_capabilities.get(session_key) is not None
+            )
+            else "the session ended before the prompt was answered",
+        )
+        # Session teardown is also a revocation boundary for an API run. Do
+        # this under the registry lock so a copied ContextVar cannot race the
+        # clear and re-register the listener.
+        lease = _api_run_approval_leases.pop(session_key, None)
+        if lease is not None and _gateway_notify_capabilities.get(session_key) is lease:
+            _gateway_notify_cbs.pop(session_key, None)
+            _gateway_notify_capabilities.pop(session_key, None)
+            _invalidate_gateway_notify_generation_locked(session_key)
+    for entry in entries:
+        # Cancel blocked waits now so the old run unwinds instead of idling until timeout;
+        # the prompt was withdrawn, nobody denied it.
+        entry.event.set()
     _release_permission_mode_dependents(session_key)
     # Session-persistent code kernels (local and remote) share this owner key and die at the same boundary so a
     # finished conversation cannot leak a live interpreter.
@@ -506,7 +907,11 @@ def save_permanent_allowlist(patterns: set):
 def is_approval_bypass_active_for_session(session_key: str) -> bool:
     """Canonical three-source bypass check: process ``--yolo`` (frozen at import), the
     session-scoped gateway ``/yolo`` toggle, ``approvals.mode: off``. Pure bypass
-    sub-expression only — hardline blocklist / permanent allowlist are the caller's job."""
+    sub-expression only — hardline blocklist / permanent allowlist are the caller's job.
+    An API-run lease is an authorization floor, so its execution context never
+    reports a bypass even when one of those ordinary-surface settings is active."""
+    if approval_context.get_current_api_server_run_lease() is not None:
+        return False
     return (_YOLO_MODE_FROZEN or is_session_yolo_enabled(session_key) or approval_context._get_approval_mode() == "off")
 
 
@@ -560,8 +965,61 @@ def _user_approved(session_key: str, description: str) -> dict:
 
 
 def _gateway_notify_cb(session_key: str):
+    """Legacy callback lookup that never exposes an execution-owned listener."""
     with _lock:
+        if _gateway_notify_capabilities.get(session_key) is not None:
+            return None
+        if _api_run_approval_leases.get(session_key) is not None:
+            return None
         return _gateway_notify_cbs.get(session_key)
+
+
+def _api_server_approval_capable() -> bool:
+    """True only when the current context has its exact live approval lease."""
+    listener = get_current_gateway_approval_listener()
+    return listener is not None and listener[1] is not None
+
+
+def _api_run_approval_is_live() -> bool:
+    """Return whether a bound API-run lease still owns its exact listener."""
+    lease = approval_context.get_current_api_server_run_lease()
+    if lease is None:
+        return False
+    return is_api_run_approval_lease_active(lease) and _api_server_approval_capable()
+
+
+def _api_run_attended_auto_approve(*, pattern_key: str, description: str) -> dict | None:
+    """``approvals.api_server_attended_mode: approve`` for a LIVE lease-bound API run: the operator
+    trusts that surface (the Clyde PWA), so the flagged action runs without prompting the phone.
+    Callers run the lease-lost checks first; this never fires for a revoked or copied lease."""
+    if not _api_run_approval_is_live():
+        return None
+    if approval_context._get_api_server_attended_approval_mode() != "approve":
+        return None
+    logger.warning("Auto-approved (pattern: %s): %s — attended API run trusted by "
+                   "approvals.api_server_attended_mode: approve.", pattern_key, description)
+    return _approved()
+
+
+def _api_run_listener_lost_if_bound(*, pattern_key: str, description: str) -> dict | None:
+    """Fail closed for a bound lease before any unattended fallback.
+
+    A context without a lease is an ordinary unattended/CLI context and must
+    retain its configured behavior.  A copied, revoked, replaced, or
+    listener-less API lease is different: it is an execution-owned context with
+    no valid consent channel and may not fall through to auto-approve.
+    """
+    if approval_context.get_current_api_server_run_lease() is None:
+        return None
+    if not _api_run_approval_is_live():
+        return _api_server_listener_lost_result(
+            pattern_key=pattern_key, description=description)
+    return None
+
+
+def _api_run_approval_failure(*, pattern_key: str, description: str) -> dict | None:
+    """Alias used by gates that need a concise pre-transport guard."""
+    return _api_run_listener_lost_if_bound(pattern_key=pattern_key, description=description)
 
 
 def _pending_result(spec, session_key: str, *, command: str, description: str,
@@ -598,6 +1056,16 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
     if smart_denied:
         result.update(smart_denied=True, allow_permanent=False)
     return result
+
+
+def _api_server_listener_lost_result(*, pattern_key: str, description: str) -> dict:
+    """Fail closed when an API execution loses its listener during approval setup."""
+    return _blocked(
+        "BLOCKED: approval required ({description}) but this API execution is unattended "
+        "and has no live approval listener. Find an alternative approach or restore the "
+        "run's approval listener before retrying.".format(description=description),
+        pattern_key=pattern_key, description=description,
+    )
 
 
 # --- Unattended contexts (nobody present to answer a prompt) --------------------------------------------------------
@@ -645,7 +1113,7 @@ def _unattended_contexts() -> list[_Unattended]:
         contexts.append(_SINGLE_QUERY_CTX)
     if _is_cron_approval_context():
         contexts.append(_CRON_CTX)
-    elif _is_unattended_platform_approval_context():
+    elif _is_unattended_platform_approval_context() and not _api_server_approval_capable():
         contexts.append(_Unattended(
             "unattended", "unattended_mode",
             "this session runs on an unattended platform "
@@ -805,14 +1273,33 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     """
     from agent.redact import redact_sensitive_text
 
+    # Determine execution ownership before any plugin transport is selected.
+    # Platform labels are routing metadata and can be copied or changed; the
+    # server-issued lease is the authority. A live API lease always grants one
+    # operation, never session/permanent scope.
+    api_run_lease = approval_context.get_current_api_server_run_lease()
+    api_run_approval = api_run_lease is not None
+    if api_run_approval:
+        lost = _api_run_approval_failure(pattern_key=pattern_key, description=description)
+        if lost is not None:
+            return lost
+
     smart_denied = False
-    if smart:
+    # A live API lease is an authorization floor, not merely a narrower set of
+    # choices. Smart approval is an auto-authorization shortcut, so API runs
+    # must reach their lease-owned once/deny listener instead of accepting the
+    # guardian's APPROVE result without an approval event.
+    if smart and not api_run_approval:
         result, smart_denied = _smart_gate(spec, command, description, pattern_key, pattern_keys,
                                            session_key, human_present=is_cli or is_gateway or is_ask)
         if result is not None:
+            if api_run_approval:
+                lost = _api_run_approval_failure(pattern_key=pattern_key, description=description)
+                if lost is not None:
+                    return lost
             return result
     pending_body = pending_body() if pending_body else None
-    allow_permanent = not smart_denied
+    allow_permanent = not smart_denied and not api_run_approval
 
     def deny(template: str, outcome: str, **fmt) -> dict:
         breaker = ""
@@ -825,17 +1312,46 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                        outcome=outcome, noun=spec.noun, **extra)
 
     def grant(choice: str) -> dict:
+        # Reconcile a plugin/transport result with the lease before allowing
+        # the operation. A transport may outlive a concurrent run teardown.
+        if api_run_approval:
+            lost = _api_run_approval_failure(pattern_key=pattern_key, description=description)
+            if lost is not None:
+                return lost
+            # Older transports may still return a broader scope even though
+            # the request advertised once-only. Normalize it at the host-owned
+            # authorization boundary and never persist an API-run choice.
+            if choice in ("session", "always"):
+                choice = "once"
         # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
-        if not smart_denied:
+        if not smart_denied and not api_run_approval:
             _persist_choice(session_key, choice, pattern_keys)
         if spec.user_approved:
             return _user_approved(session_key, description)
         return _approved()
 
-    if spec.transport:
+    if api_run_approval:
+        # Smart-review/payload construction can run arbitrary plugin hooks. Re-check
+        # the execution-owned lease immediately before selecting any transport so a
+        # teardown during those hooks cannot dispatch a stale approval request.
+        lost = _api_run_approval_failure(pattern_key=pattern_key, description=description)
+        if lost is not None:
+            return lost
+        if not is_gateway:
+            # The lease-owned listener is the only approval surface for an API
+            # execution. Do not let a copied context fall through to a CLI
+            # prompt, even when the caller supplied CLI-shaped presence flags.
+            return _api_server_listener_lost_result(
+                pattern_key=pattern_key, description=description)
+
+    # A plugin transport is an ordinary-surface choice. API runs always use
+    # their exact lease-backed listener so a plugin cannot authorize without the
+    # API event or return a broader persistent scope.
+    if spec.transport and not api_run_approval and _get_session_platform() != "api_server":
         attempt = _present_with_selected_transport(
             command=command, description=description, pattern_key=pattern_key, pattern_keys=pattern_keys,
-            session_key=session_key, allow_session=not smart_denied, allow_permanent=allow_permanent,
+            session_key=session_key, allow_session=(not smart_denied and not api_run_approval),
+            allow_permanent=allow_permanent,
             surface=approval_context.gateway_approval_surface() if (is_gateway or is_ask) else "cli",
         )
         choice, denied = _transport_choice(attempt, pattern_key=pattern_key, description=description)
@@ -854,20 +1370,34 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         # command still executes after approval and persistence keys off pattern_key.
         display_command = redact_sensitive_text(command)
         display_description = redact_sensitive_text(description)
-        notify_cb = _gateway_notify_cb(session_key)
-        if notify_cb is not None:
-            # Smart DENY overrides are one-operation decisions, so the UI must not offer a
-            # permanent or session scope.
+        session_platform = _get_session_platform()
+        listener = get_current_gateway_approval_listener()
+        notify_cb = None
+        capability = None
+        if listener is not None:
+            notify_cb, capability = listener
+            # Any non-None lease means this is an API-run approval, even if a
+            # copied context is executing on a non-API surface. API approvals are
+            # one-operation events and never write session/permanent allow state.
+            if capability is not None:
+                api_run_approval = True
             data = {
                 "command": display_command, "pattern_key": pattern_key,
                 "pattern_keys": pattern_keys, "description": display_description,
-                "allow_permanent": not smart_denied,
-                "allow_session": not smart_denied,
+                "allow_permanent": not smart_denied and not api_run_approval,
+                "allow_session": not smart_denied and not api_run_approval,
             }
             if smart_denied:
                 data["smart_denied"] = True
-            decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway")
+            decision = _await_gateway_decision(
+                session_key, notify_cb, data, surface="gateway",
+                api_server_capability=capability,
+                require_api_server_capability=capability is not None,
+            )
             if decision.get("notify_failed"):
+                if session_platform == "api_server" or capability is not None:
+                    return _api_server_listener_lost_result(
+                        pattern_key=pattern_key, description=description)
                 return _denied(spec.notify_failed, pattern_key=pattern_key,
                                description=description, outcome="notify_failed", noun=spec.noun)
             # Consent contract: silence is NOT consent, and an explicit deny is a hard
@@ -890,9 +1420,14 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                             timeout_addendum="", deny_reason=deny_reason)
             return grant(choice)
 
+        if session_platform == "api_server" or approval_context.get_current_api_server_run_lease() is not None:
+            # A stale lease is still an execution-owned context; never turn its
+            # missing listener into a CLI prompt or a pending gateway request.
+            return _api_server_listener_lost_result(
+                pattern_key=pattern_key, description=description)
+
         # No gateway callback (cron, batch, or ask-mode leaked into an interactive CLI, historically via `import
-        # gateway.run`): paint the local panel when possible instead of a pending_approval that makes the agent look
-        # "auto-blocked".
+        # gateway.run`): paint the local panel when possible instead of a silent pending approval.
         if not _should_fall_through_to_cli_approval(
             is_cli=is_cli, approval_callback=approval_callback, notify_cb=notify_cb,
         ):
@@ -912,6 +1447,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                        pattern_keys=list(pattern_keys), session_key=session_key, surface="cli")
     approval_context._fire_approval_hook("pre_approval_request", **hook_kwargs)
     choice = prompt_dangerous_approval(prompt_command, prompt_description, allow_permanent=allow_permanent,
+                                       allow_session=not api_run_approval,
                                        smart_denied=smart_denied, approval_callback=approval_callback)
     approval_context._fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
     if choice == "timeout":
@@ -944,10 +1480,20 @@ def _presence(approval_callback=None) -> tuple:
     generic TurnRunner lane, which registers a notifier for *every* turn — but those adapters
     render no approval surface and the inbound lane has no reader, so there ``is_ask`` drops
     regardless and the unattended branch resolves from ``approvals.unattended_mode`` instead of
-    parking an unanswerable card (#100532)."""
+    parking an unanswerable card (#100532). An api_server turn also needs its exact run
+    notifier (the server-issued lease) before a leaked HERMES_EXEC_ASK can count as a surface."""
     approval_callback = _resolve_cli_approval_callback(approval_callback)
-    is_cli, is_gateway = _is_interactive_cli(), _is_gateway_approval_context()
+    session_platform = _get_session_platform()
+    api_server_approval_capable = _api_server_approval_capable()
+    api_lease_bound = approval_context.get_current_api_server_run_lease() is not None
+    is_cli, is_gateway = _is_interactive_cli(), (
+        _is_gateway_approval_context() or api_server_approval_capable
+    )
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
+    if (session_platform == "api_server" or api_lease_bound) and not api_server_approval_capable:
+        # API runs have no CLI input path. Do not let process-level flags leaked from another
+        # surface turn a missing per-run listener into a pending request nobody can answer.
+        is_cli = is_ask = False
     if _is_single_query_approval_context() or _is_cron_approval_context():
         is_cli = is_gateway = is_ask = False
     elif is_ask and _is_unattended_platform_approval_context() \
@@ -983,17 +1529,37 @@ def _run_approval_gate(
     Unattended deny text is ``ctx.block_message(subject, noun, advice)`` unless the caller passes
     an explicit ``*_deny_message`` (the file-tool write gates word their own).
     """
+    # A bound API lease is an execution-owned context even when a copied
+    # ContextVar no longer carries the original platform marker. Validate it
+    # before yolo/session/unattended shortcuts so a revoked lease cannot fall
+    # through to unattended_mode: approve.
+    api_run_bound = approval_context.get_current_api_server_run_lease() is not None
+    if api_run_bound:
+        lost = _api_run_approval_failure(pattern_key=pattern_key, description=description)
+        if lost is not None:
+            return lost
+        trusted = _api_run_attended_auto_approve(pattern_key=pattern_key, description=description)
+        if trusted is not None:
+            return trusted
     # Hardline blocks are the caller's job BEFORE this gate, so yolo here only skips the recoverable approval layer.
     # ``approvals.mode: off`` is the third bypass source (the Desktop "Approvals: off" toggle writes it); the shell
     # guards honour it, so every action routed through this gate (computer_use, plugin rules, SSH-config writes,
     # dangerous-pattern prompts) must too, or "off" still prompts on those surfaces.
-    if _yolo_active() or approval_context._get_approval_mode() == "off":
+    # A live API lease is an authorization floor and must not inherit process or
+    # session YOLO authorization.
+    if not api_run_bound and (_yolo_active() or approval_context._get_approval_mode() == "off"):
         return _approved()
     session_key = get_current_session_key()
-    if is_approved(session_key, pattern_key):
+    if not api_run_bound and is_approved(session_key, pattern_key):
         return _approved()
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
+    if (not is_cli and not is_gateway
+            and approval_context.get_current_api_server_run_lease() is not None):
+        # A copied/revoked lease is not an interactive surface. Fail closed without
+        # manufacturing a pending request that no API client can resolve.
+        return _api_server_listener_lost_result(
+            pattern_key=pattern_key, description=description)
     if not is_cli and not is_gateway and not is_ask:
         log_args = (autoapprove_log_prefix, pattern_key, description)
         # Every unattended context resolves instantly — never a pending approval nobody can answer.
@@ -1098,17 +1664,33 @@ def check_dangerous_command(command: str, env_type: str,
     """Detect a dangerous command and handle approval (pattern layer only). ``has_host_access``:
     a Docker sandbox that bind-mounts host paths must not skip approval.
     Returns ``{"approved": True/False, "message": str or None, ...}``."""
-    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+    api_run_bound = approval_context.get_current_api_server_run_lease() is not None
+    if api_run_bound:
+        lost = _api_run_approval_failure(pattern_key="dangerous_command", description="dangerous command")
+        if lost is not None:
+            return lost
+    # Isolated backends retain their ordinary non-API fast path. A bound API
+    # lease disables that shortcut so a dangerous terminal command still reaches
+    # the lease-owned once/deny gate.
+    if not api_run_bound and _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _user_deny_block(command) or _approved()
     blocked = _floor_block(command)
     if blocked is not None:
         return blocked
-    if _yolo_active():
+    if api_run_bound:
+        lost = _api_run_approval_failure(pattern_key="dangerous_command", description="dangerous command")
+        if lost is not None:
+            return lost
+    if not api_run_bound and _yolo_active():
         return _approved()
-    if _command_matches_permanent_allowlist(command):
+    if not api_run_bound and _command_matches_permanent_allowlist(command):
         return _approved()
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
     if not is_dangerous:
+        if api_run_bound:
+            lost = _api_run_approval_failure(pattern_key="dangerous_command", description="dangerous command")
+            if lost is not None:
+                return lost
         return _approved()
     return _run_approval_gate(
         pattern_key=pattern_key, description=description, display_target=command, approval_callback=approval_callback,
@@ -1154,12 +1736,25 @@ def check_all_command_guards(command: str, env_type: str,
     """Run all pre-exec security checks and return a single approval decision. Plugins that
     want to veto or escalate a command do it from ``pre_tool_call``.
     ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow."""
-    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+    api_run_bound = approval_context.get_current_api_server_run_lease() is not None
+    if api_run_bound:
+        lost = _api_run_approval_failure(pattern_key="dangerous_command", description="dangerous command")
+        if lost is not None:
+            return lost
+    # Keep the isolated-container shortcut for ordinary sessions, but never let
+    # it outrank an API-run lease. /v1/runs can select these backends too.
+    if not api_run_bound and _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _user_deny_block(command) or _approved()
 
     blocked = _floor_block(command, sudo_guard=True)
     if blocked is not None:
         return blocked
+
+    # Lease loss fails closed BEFORE any prepared decision can be consumed.
+    if api_run_bound:
+        lost = _api_run_approval_failure(pattern_key="dangerous_command", description="dangerous command")
+        if lost is not None:
+            return lost
 
     from agent.terminal_approval_batch import consume_prepared_guard
     prepared = consume_prepared_guard(command, env_type, has_host_access)
@@ -1167,12 +1762,28 @@ def check_all_command_guards(command: str, env_type: str,
         return prepared
 
     approval_mode = approval_context._get_approval_mode()
-    if _yolo_active() or approval_mode == "off":
+    if not api_run_bound and (_yolo_active() or approval_mode == "off"):
         return _approved()
-    if _command_matches_permanent_allowlist(command):
+    if not api_run_bound and _command_matches_permanent_allowlist(command):
         return _approved()
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
+    # The listener can be revoked between the initial check and presence
+    # discovery. Reconcile again before the unattended branch: a bound stale
+    # lease must never inherit unattended_mode: approve.
+    if api_run_bound:
+        lost = _api_run_approval_failure(pattern_key="dangerous_command", description="dangerous command")
+        if lost is not None:
+            return lost
+        trusted = _api_run_attended_auto_approve(pattern_key="dangerous_command", description="dangerous command")
+        if trusted is not None:
+            return trusted
+    if api_run_bound and not is_gateway:
+        # Do not let a leaked ask/CLI flag become an unattended fallback after
+        # the exact API listener disappears between presence discovery and this
+        # branch.
+        return _api_server_listener_lost_result(
+            pattern_key="dangerous_command", description="dangerous command")
     # Outside CLI/gateway/ask flows we never block on approvals: each
     # unattended context applies its configured deny/approve mode, else allow.
     if not is_cli and not is_gateway and not is_ask:
@@ -1184,7 +1795,11 @@ def check_all_command_guards(command: str, env_type: str,
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
     session_key = get_current_session_key()
-    if not is_dangerous or is_approved(session_key, pattern_key):
+    if not is_dangerous or (not api_run_bound and is_approved(session_key, pattern_key)):
+        if api_run_bound:
+            lost = _api_run_approval_failure(pattern_key="dangerous_command", description="dangerous command")
+            if lost is not None:
+                return lost
         return _approved()
     return _human_decision(
         _COMMAND_GATE, command=command, description=description,
@@ -1231,17 +1846,38 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     pattern_key = "execute_code"
     description = _EXECUTE_CODE_DESCRIPTION
 
-    # Isolated backends already sandbox the child. vercel_sandbox has no host-bind concept so it stays always-skipped.
-    if env_type == "vercel_sandbox":
-        return _approved()
-    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
-        return _approved()
+    # Isolated backends remain fast-paths for ordinary non-API calls. A live
+    # API lease is intentionally stronger than the sandbox shortcut because the
+    # execute_code tool can still perform arbitrary work inside the selected
+    # backend and the lease is the required authorization floor.
+    api_run_bound = approval_context.get_current_api_server_run_lease() is not None
+    if api_run_bound:
+        lost = _api_run_approval_failure(pattern_key=pattern_key, description=description)
+        if lost is not None:
+            return lost
+    if not api_run_bound:
+        if env_type == "vercel_sandbox":
+            return _approved()
+        if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+            return _approved()
     approval_mode = approval_context._get_approval_mode()
-    if _yolo_active() or approval_mode == "off":
+    if not api_run_bound and (_yolo_active() or approval_mode == "off"):
         return _approved()
 
     # (-q clears the presence flags, but its unattended context resolves first anyway.)
     approval_callback, is_cli, is_gateway, is_ask = _presence()
+    if api_run_bound:
+        # Cleanup can win after the first lease check but before presence
+        # discovery. Do not let that race reach unattended_mode: approve.
+        lost = _api_run_approval_failure(pattern_key=pattern_key, description=description)
+        if lost is not None:
+            return lost
+        if not is_gateway:
+            return _api_server_listener_lost_result(
+                pattern_key=pattern_key, description=description)
+        trusted = _api_run_attended_auto_approve(pattern_key=pattern_key, description=description)
+        if trusted is not None:
+            return trusted
     # No user is present to approve arbitrary code in -q / cron / unattended
     # sessions: the first active context resolves instantly from its mode.
     for ctx in _unattended_contexts():
@@ -1270,7 +1906,7 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
 
     # Without this, "Approve session" / "Always" choices are stored but never
     # consulted, so every execute_code call re-prompts (#39275).
-    if is_approved(session_key, pattern_key):
+    if not api_run_bound and is_approved(session_key, pattern_key):
         return _approved()
 
     # Smart mode: an APPROVE only suppresses the redundant whole-script prompt; the per-call terminal() guards still

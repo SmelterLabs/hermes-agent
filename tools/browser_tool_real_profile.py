@@ -307,7 +307,10 @@ def _real_profile_cdp() -> tuple:
             return cached, None
         _bt._real_profile_cdp_cache.pop("cdp", None)
 
-        browser = detect_default_chromium()
+        source = str(_bt._browser_cfg(
+            "real_profile_browser", "default", str, "real-profile browser source from config",
+        ) or "default").strip().lower()
+        browser = detect_default_chromium() if source in ("", "default", "auto") else source
         unsupported = _real_profile_unsupported_reason(browser)
         if unsupported:
             return None, unsupported

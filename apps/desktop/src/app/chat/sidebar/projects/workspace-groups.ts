@@ -55,6 +55,10 @@ export interface SidebarProjectTree {
   id: string
   label: string
   path: null | string
+  // In the all-profiles tree, the profile whose configured terminal cwd is
+  // this project. Project "+" uses it instead of whichever backend was last
+  // active while browsing the aggregate view.
+  defaultProfile?: string
   color?: null | string
   icon?: null | string
   archived?: boolean

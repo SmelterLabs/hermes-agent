@@ -82,7 +82,7 @@ export function ProjectBackRow({ label, onClick }: { label: string; onClick: () 
 interface ProjectOverviewRowProps {
   project: SidebarProjectTree
   onEnter?: (id: string) => void
-  onNewSession?: (path: null | string) => void
+  onNewSession?: (path: null | string, profile?: string) => void
   /** Drag the project's "+" onto a chat zone: create a new session pinned to
    *  this project's cwd, placed exactly where it's dropped. */
   onNewSessionSplit?: NewSessionSplitHandler
@@ -214,7 +214,11 @@ export function ProjectOverviewRow({
           {onNewSession && (
             <WorkspaceAddButton
               label={s.newSessionIn(project.label)}
-              onClick={() => onNewSession(newSessionPath)}
+              onClick={() =>
+                project.defaultProfile
+                  ? onNewSession(newSessionPath, project.defaultProfile)
+                  : onNewSession(newSessionPath)
+              }
               onPointerDown={
                 onNewSessionSplit
                   ? event => {

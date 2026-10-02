@@ -653,6 +653,14 @@ export function useGatewayBoot({
       // only a socket that is provably dead.
 
       if (!gatewayOpen()) {
+        // Ambient nudge (focus/visibility) while the backoff loop is armed or
+        // mid-dial: let it work. Clearing the timer and dialing per nudge
+        // turned every click into an immediate dial against a cold-booting
+        // backend — the observed storms where clicking made recovery worse.
+        if (!forceOpenSocket && (reconnectTimer !== null || reconnecting)) {
+          return
+        }
+
         await attemptReconnect()
 
         return
@@ -693,7 +701,17 @@ export function useGatewayBoot({
 
         const decision = decideLivenessForceClose({
           workingSessionCount: $workingSessionIds.get().length,
-          consecutiveFailures: livenessProbeFailures
+          consecutiveFailures: livenessProbeFailures,
+          // A pending RPC (a session.resume grinding through a cold agent
+          // build, a slow sidebar refresh) makes probe silence as
+          // inconclusive as a running turn — tearing the socket down would
+          // cancel the very work being waited on and redial into the same
+          // busy backend.
+          pendingRpcCount: gateway.pendingRequestCount,
+          // Frames delivered during the silence are positive proof of life:
+          // the transport serves, the probe merely starved.
+          msSinceLastServed:
+            typeof gateway.lastServedAtMs === 'number' ? Date.now() - gateway.lastServedAtMs : Number.POSITIVE_INFINITY
         })
 
         if (!decision.close) {

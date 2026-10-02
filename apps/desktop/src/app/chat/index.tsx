@@ -181,7 +181,13 @@ function ChatHeader({
             'calc(100vw - var(--titlebar-content-inset,0px) - var(--titlebar-tools-right) - var(--titlebar-tools-width) - 1.5rem)'
         }}
       >
-        {showProfileTag && <ProfileTag className="pointer-events-auto mr-1.5" profile={activeStoredSession?.profile} />}
+        {showProfileTag && (
+          <ProfileTag
+            className="pointer-events-auto mr-1.5"
+            connectionId={activeStoredSession?.connection_id}
+            profile={activeStoredSession?.profile}
+          />
+        )}
         <SessionActionsMenu
           align="start"
           onDelete={selectedSessionId ? onDeleteSelectedSession : undefined}
@@ -686,7 +692,14 @@ const ChatViewContent = memo(function ChatViewContent({
     routedSessionView: isRoutedSessionView
   })
 
-  const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
+  // Compression rotates the stored tip, not the conversation being read.
+  // Keying the transcript by that tip resets its budget and pins the viewport
+  // to the bottom on a background refresh. Share the composer's lineage scope,
+  // but resolve from this view's selection (tiles have no primary route).
+  const threadKey =
+    resolveComposerSessionKey(selectedSessionId, sessions) ||
+    activeSessionId ||
+    (isRoutedSessionView ? location.pathname : 'new')
 
   const chatBarState = useChatBarState({
     activeGatewayProfile,

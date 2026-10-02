@@ -102,7 +102,16 @@ function makeRefresh(resolveSession: ActiveTranscriptRefreshDeps['resolveSession
       updateSessionState
     })
 
-  return { activeSessionIdRef, busyRef, refresh, selectedStoredSessionIdRef, state, states, updateSessionState }
+  return {
+    activeSessionIdRef,
+    busyRef,
+    refresh,
+    selectedStoredSessionIdRef,
+    signatureRef,
+    state,
+    states,
+    updateSessionState
+  }
 }
 
 function useSyncHarness({
@@ -235,6 +244,32 @@ describe('resolveActiveTranscriptSession', () => {
 describe('active transcript refresh', () => {
   beforeEach(() => {
     vi.mocked(getLatestSessionMessages).mockResolvedValue(transcript('answer') as never)
+  })
+
+  it('keeps a populated transcript when a sessions.changed read is transiently empty and retries it', async () => {
+    const fixture = makeRefresh()
+
+    fixture.state.messages = [
+      {
+        id: 'existing-user',
+        parts: [{ text: 'keep this visible', type: 'text' }],
+        role: 'user'
+      }
+    ]
+    vi.mocked(getLatestSessionMessages).mockResolvedValueOnce({ messages: [], session_id: ACTIVE_STORED_ID } as never)
+
+    await fixture.refresh()
+
+    expect(fixture.states.get(ACTIVE_RUNTIME_ID)?.messages).toEqual(fixture.state.messages)
+    expect(fixture.signatureRef.current.size).toBe(0)
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValueOnce(transcript('retry succeeded') as never)
+    await fixture.refresh()
+
+    expect(fixture.states.get(ACTIVE_RUNTIME_ID)?.messages.at(-1)?.parts[0]).toMatchObject({
+      text: 'retry succeeded'
+    })
+    expect(fixture.signatureRef.current.size).toBe(1)
   })
 
   it('refreshes a hidden session through its unique complete owner route', async () => {
@@ -402,6 +437,58 @@ describe('active transcript refresh', () => {
 
     expect(getLatestSessionMessages).not.toHaveBeenCalled()
     expect(updateSessionState).not.toHaveBeenCalled()
+  })
+
+  it('retries a populated listed tile after a transient empty read without caching its row fingerprint', async () => {
+    const runtimeId = 'runtime-populated-tile'
+    const storedId = 'stored-populated-tile'
+    setSessions([makeSessionInfo({ id: storedId, last_active: 99, message_count: 2, preview: 'same row' })])
+    let state = createClientSessionState(storedId)
+
+    state.messages = [
+      {
+        id: 'tile-existing-user',
+        parts: [{ text: 'keep tile visible', type: 'text' }],
+        role: 'user'
+      }
+    ]
+
+    publishSessionState(runtimeId, state)
+    vi.mocked(getLatestSessionMessages).mockResolvedValueOnce({ messages: [], session_id: storedId } as never)
+
+    const signatureRef = { current: new Map<string, string>() }
+
+    const updateSessionState: Parameters<typeof reconcileTileTranscriptsForTest>[0]['updateSessionState'] = vi.fn(
+      (_sessionId, updater) => {
+        state = updater(state)
+
+        return state
+      }
+    )
+
+    await reconcileTileTranscriptsForTest({
+      tiles: [{ runtimeId, storedSessionId: storedId }],
+      requestSequenceRef: { current: 0 },
+      signatureRef,
+      updateSessionState
+    })
+
+    expect(state.messages[0]?.parts[0]).toMatchObject({ text: 'keep tile visible' })
+    expect(signatureRef.current.size).toBe(0)
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValueOnce(transcript('refreshed tile answer', storedId) as never)
+
+    await reconcileTileTranscriptsForTest({
+      tiles: [{ runtimeId, storedSessionId: storedId }],
+      requestSequenceRef: { current: 0 },
+      signatureRef,
+      updateSessionState
+    })
+
+    expect(state.messages.find(message => message.role === 'assistant')?.parts[0]).toMatchObject({
+      text: 'refreshed tile answer'
+    })
+    expect(signatureRef.current.size).toBe(2)
   })
 
   it('discards a tile snapshot when the tile closes during the read', async () => {

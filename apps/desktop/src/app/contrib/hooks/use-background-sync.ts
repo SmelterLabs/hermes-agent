@@ -65,6 +65,26 @@ interface ActiveTranscriptSession {
   profile?: string | null
 }
 
+/** Preserve a populated renderer transcript across a transactional zero-row read. */
+export function reconcileFetchedTranscript(messages: ChatMessage[], current: ChatMessage[]): ChatMessage[] {
+  if (messages.length === 0 && current.length > 0) {
+    return current
+  }
+
+  // Same composition order as reconcileAuthoritativeChatMessages
+  // (use-session-actions/index.ts): an un-acked optimistic `user-*` row exists
+  // only here, so a refresh that lands mid-send must not drop it.
+  // Trailing client-local system notices (fallback switch, #126422) are
+  // re-grafted last: the stored page cannot carry them.
+  return preserveLocalSystemNotices(
+    preserveLocalAssistantErrors(
+      preserveLocalPendingTurnMessages(graftRefreshedTailOntoBackfill(messages, current), current),
+      current
+    ),
+    current
+  )
+}
+
 /** Profile/connection scope used to read an active transcript from storage. */
 export function profileScopeForTranscriptSession(stored: ActiveTranscriptSession | undefined): ProfileScope {
   if (!stored) {
@@ -370,38 +390,43 @@ export async function reconcileTileTranscripts({
         continue
       }
 
-      signatureRef.current.set(signatureKey, signature)
-
-      // Remember the row fingerprint that produced this transcript, so the
-      // next tick's pre-fetch gate can skip the fetch while the row is
-      // unchanged (#95767).
-      if (listRow) {
-        signatureRef.current.set(rowFingerprintKey, sessionListFingerprint(listRow))
-      }
+      let accepted = false
 
       updateSessionState(
         runtimeSessionId,
-        state => ({
-          ...state,
-          // An un-acked optimistic `user-*` row exists only here, so a
-          // background refresh that lands mid-send would drop it and the
-          // message would have to be retyped. Same composition order as
-          // reconcileAuthoritativeChatMessages (use-session-actions/index.ts).
-          // Trailing client-local system notices (fallback switch, #126422)
-          // are re-grafted last: the stored page cannot carry them.
-          messages: preserveLocalSystemNotices(
-            preserveLocalAssistantErrors(
-              preserveLocalPendingTurnMessages(
-                graftRefreshedTailOntoBackfill(messages, state.messages),
-                state.messages
-              ),
-              state.messages
-            ),
-            state.messages
-          )
-        }),
+        state => {
+          // state.db is replaced transactionally. The change watcher can see
+          // the replacement before the new file's transcript is readable,
+          // yielding one empty snapshot between two populated snapshots.
+          // Publishing that transient empty array makes assistant-ui's
+          // concurrent message lookup race a zero-length repository (React
+          // #520), visibly forcing a synchronous whole-root redraw.
+          const reconciled = reconcileFetchedTranscript(messages, state.messages)
+
+          if (reconciled === state.messages) {
+            return state
+          }
+
+          accepted = true
+
+          return {
+            ...state,
+            messages: reconciled
+          }
+        },
         storedSessionId
       )
+
+      // A rejected empty snapshot must remain retryable on the next watcher
+      // edge; caching its signature would suppress that retry.
+      if (accepted) {
+        signatureRef.current.set(signatureKey, signature)
+        // Only accepted reads may suppress future fetches. A transient empty
+        // page must remain retryable even when the sidebar row is unchanged.
+        if (listRow) {
+          signatureRef.current.set(rowFingerprintKey, sessionListFingerprint(listRow))
+        }
+      }
     } catch {
       // Non-fatal: the next change event retries.
     }
@@ -643,26 +668,38 @@ export async function reconcileActiveTranscript({
       return
     }
 
-    signatureRef.current.set(signatureKey, signature)
+    let accepted = false
 
     updateSessionState(
       runtimeSessionId,
-      state => ({
-        ...state,
-        // The refresh re-reads only the newest tail page; graft it onto any
-        // older pages "Show earlier" already backfilled instead of clobbering
-        // them (see transcript-backfill). Trailing client-local system notices
-        // (fallback switch, #126422) are re-grafted last.
-        messages: preserveLocalSystemNotices(
-          preserveLocalAssistantErrors(
-            preserveLocalPendingTurnMessages(graftRefreshedTailOntoBackfill(messages, state.messages), state.messages),
-            state.messages
-          ),
-          state.messages
-        )
-      }),
+      state => {
+        // Never replace an already-populated live chat with the transient
+        // zero-row view that can appear while state.db is being swapped. Apart
+        // from blanking the thread, assistant-ui can observe stale message
+        // indices against that empty repository and force React's #520
+        // synchronous full-root recovery.
+        const reconciled = reconcileFetchedTranscript(messages, state.messages)
+
+        if (reconciled === state.messages) {
+          return state
+        }
+
+        accepted = true
+
+        return {
+          ...state,
+          // The refresh re-reads only the newest tail page; graft it onto any
+          // older pages "Show earlier" already backfilled instead of clobbering
+          // them (see transcript-backfill).
+          messages: reconciled
+        }
+      },
       storedSessionId
     )
+
+    if (accepted) {
+      signatureRef.current.set(signatureKey, signature)
+    }
   } catch {
     // Non-fatal: the next change event or manual resume can hydrate the view.
   }

@@ -22,6 +22,11 @@ def _ctx(name: str, default: str | None = "") -> contextvars.ContextVar:
 # Per-thread/per-task gateway session identity: gateway runs agent turns concurrently in executor threads, so a
 # process-global env var is racy (the env fallback stays for legacy single-threaded callers).
 _approval_session_key: contextvars.ContextVar[str] = _ctx("approval_session_key")
+# Server-issued, revocable lease for a live ``/v1/runs`` executor.  The old
+# capability-named accessors remain as compatibility shims; the run id/session
+# key is client-controlled and is deliberately not sufficient to establish
+# approval ownership. Only ``api_server_runs._run_agent_sync`` binds this value.
+_api_server_run_capability: contextvars.ContextVar[object | None] = _ctx("api_server_run_capability", None)
 _approval_turn_id: contextvars.ContextVar[str] = _ctx("approval_turn_id")
 _approval_tool_call_id: contextvars.ContextVar[str] = _ctx("approval_tool_call_id")
 # Hermes session id (observability identity, distinct from the gateway routing session_key), forwarded to approval
@@ -121,6 +126,36 @@ def set_current_session_key(session_key: str) -> contextvars.Token[str]:
 def reset_current_session_key(token: contextvars.Token[str]) -> None:
     """Restore the prior approval session key context."""
     _approval_session_key.reset(token)
+
+
+def set_current_api_server_run_capability(capability: object) -> contextvars.Token:
+    """Bind the opaque capability owned by the current ``/v1/runs`` executor."""
+    return _api_server_run_capability.set(capability)
+
+
+def reset_current_api_server_run_capability(token: contextvars.Token) -> None:
+    """Restore the prior API-run approval capability context."""
+    _api_server_run_capability.reset(token)
+
+
+def get_current_api_server_run_capability() -> object | None:
+    """Return the execution-owned API-run approval lease, if one is bound."""
+    return _api_server_run_capability.get()
+
+
+def set_current_api_server_run_lease(lease: object | None) -> contextvars.Token:
+    """Bind a server-issued API-run approval lease (lease-named API)."""
+    return set_current_api_server_run_capability(lease)
+
+
+def reset_current_api_server_run_lease(token: contextvars.Token) -> None:
+    """Restore the previous API-run approval lease."""
+    reset_current_api_server_run_capability(token)
+
+
+def get_current_api_server_run_lease() -> object | None:
+    """Return the current server-issued API-run approval lease."""
+    return get_current_api_server_run_capability()
 
 
 _Tokens = tuple[contextvars.Token[str], contextvars.Token[str], contextvars.Token[str]]
@@ -369,6 +404,14 @@ def _get_unattended_approval_mode() -> str:
     deny — an unattended session never silently runs a flagged action unless the
     operator explicitly trusts it."""
     return _binary_approval_mode("unattended_mode")
+
+
+def _get_api_server_attended_approval_mode() -> str:
+    """Approval mode for an ATTENDED ``/v1/runs`` run — one bound to a live, revocable approval
+    lease (the Clyde PWA). Default deny keeps the interactive gate (the phone is asked); ``approve``
+    means the operator trusts that surface and flagged actions run without a prompt. It is consulted
+    only after the lease-lost checks, so a revoked or copied lease can never inherit it."""
+    return _binary_approval_mode("api_server_attended_mode")
 
 
 def _get_approval_transport_config() -> tuple[str, str | None]:

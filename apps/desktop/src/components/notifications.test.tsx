@@ -1,21 +1,40 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
-import { clearNotifications, notify } from '@/store/notifications'
+import { I18nProvider } from '@/i18n'
+import { $notifications, clearNotifications, notify, notifyError, setToastMessagesEnabled } from '@/store/notifications'
 import { stubResizeObserver } from '@/test/jsdom'
 
 import { NotificationStack } from './notifications'
 
 beforeAll(stubResizeObserver)
 
+const LONG_TITLE = 'This turn is no longer in server history (it may have been compressed away).'
+const DETAIL = 'target user message is no longer in session history'
+
 describe('toast titles', () => {
   beforeEach(() => {
+    setToastMessagesEnabled(true)
     clearNotifications()
   })
 
   afterEach(() => {
     cleanup()
     clearNotifications()
+    setToastMessagesEnabled(false)
+  })
+
+  it('suppresses every toast when messages are disabled', () => {
+    setToastMessagesEnabled(false)
+    notify({ kind: 'error', title: LONG_TITLE, message: DETAIL })
+
+    render(
+      <I18nProvider configClient={null} initialLocale="en">
+        <NotificationStack />
+      </I18nProvider>
+    )
+
+    expect(screen.queryByText(LONG_TITLE)).toBeNull()
   })
 
   it.each(['default', 'bottom-right'] as const)(

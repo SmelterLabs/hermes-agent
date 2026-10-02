@@ -210,6 +210,14 @@ The sidebar foot follows one hierarchy: **gateway → profile → sessions**.
 Gateways are machines or hosted backends; profiles are isolated Hermes agents
 that live on one gateway.
 
+:::note Local Desktop overlay
+This build keeps `FLEET_RAIL_ENABLED = false`: the strip shows only the selected
+box's profiles, and the statusbar gateway selector changes boxes. The full-fleet
+rail behavior described below remains available in source but is not enabled.
+Default profiles retain their configured owner display name and avatar, and
+session profile badges identify ownership even outside the All profiles view.
+:::
+
 - With one registered gateway, no gateway control is added. Local-only Desktop
   keeps the same profile rail and keyboard flow as before.
 - With several gateways, the sidebar shows one named gateway selector. Its device,
@@ -224,8 +232,10 @@ that live on one gateway.
 - With several gateways the profile rail is a **fleet rail**: every registered
   gateway's profiles sit on the one strip, each group headed by that gateway's
   kind glyph (device, network, terminal, cloud) — the same glyph the gateway
-  selector uses. The active gateway's squares look exactly as they do on a
-  single-gateway Desktop; the other gateways' squares are dimmed ("at rest").
+  selector uses. The active gateway's default profile retains its configured
+  owner display name and avatar (for example, Bellow for Forge's canonical
+  `default` profile); the other squares look exactly as they do on a
+  single-gateway Desktop. Other gateways' squares are dimmed ("at rest").
   Hovering an at-rest square names its machine (`omer · This device`), so two
   same-named profiles on different machines never read alike.
 - Clicking an at-rest square performs the same switch as the gateway selector,

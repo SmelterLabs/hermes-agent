@@ -33,6 +33,16 @@ const DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 30_000
 // agent-turn ceiling (agent.gateway_timeout = 1800s) so the ack timeout only
 // ever fires when the turn itself would have been abandoned server-side.
 export const PROMPT_SUBMIT_REQUEST_TIMEOUT_MS = 1_800_000
+// session.resume on a COLD session runs a full agent build server-side
+// (skills scan, MCP discovery, config, provider probes) before it can answer
+// — measured from 30s to several minutes on a many-profile install. The
+// generic 30s default therefore guaranteed a "Resume failed: request timed
+// out after 30s" toast on the FIRST open of any cold session, and the UI's
+// retry re-kicked the same build against the already-grinding backend (the
+// first-click storm feeder). Same principle as PROMPT_SUBMIT above: bound
+// the ack generously so the timeout only fires when the open would never
+// have succeeded.
+export const SESSION_RESUME_REQUEST_TIMEOUT_MS = 300_000
 
 export const GATEWAY_NOT_CONNECTED_MESSAGE = 'Hermes gateway is not connected'
 

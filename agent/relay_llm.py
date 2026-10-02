@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import contextvars
 import inspect
@@ -111,6 +112,17 @@ class _ManagedAttempt:
 
         return self.context.copy().run(guarded)
 
+    def run_provider(self, callback: Callable[..., Any], request: Any) -> Any:
+        """Run a synchronous provider call. Relay drives it on its private event loop, so a client
+        that switches to its async API whenever it sees a running loop (the Claude direct-SDK plugin)
+        answers with an un-started coroutine; discard it and ask again from a thread with no loop."""
+        raw = self.run_callback(callback, request)
+        if not inspect.iscoroutine(raw):
+            return raw
+        raw.close()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="relay-provider") as pool:
+            return pool.submit(self.run_callback, callback, request).result()
+
     def _record(self, raw: Any) -> Any:
         self.raw_response["value"] = raw
         self.raw_response["json"] = _jsonable(raw)
@@ -127,7 +139,7 @@ class _ManagedAttempt:
     def invoke(self, callback: Callable[..., Any], next_request: Any) -> Any:
         """Provider callback handed to Relay: run ``callback`` on Relay's (possibly rewritten) request."""
         with self._recording_errors():
-            raw = self.run_callback(callback, self.provider_request(next_request))
+            raw = self.run_provider(callback, self.provider_request(next_request))
         return self._record(raw)
 
     async def invoke_async(self, callback: Callable[..., Any], next_request: Any) -> Any:
@@ -350,7 +362,7 @@ class ManagedLlmStream(Iterator[Any]):
         run_callback = attempt.run_callback
         raw_stream = None
         try:
-            raw_stream = run_callback(self._stream_factory, attempt.provider_request(next_request))
+            raw_stream = attempt.run_provider(self._stream_factory, attempt.provider_request(next_request))
             predicate = self._completed_response_predicate
             if predicate is not None and run_callback(predicate, raw_stream):
                 self.final_response = raw_stream

@@ -31,6 +31,19 @@ import { clearSingleFlightSessionResumeState, registerRecoveredRuntime } from '.
 
 import { usePromptActions } from '.'
 
+/** True once a session.resume for `storedId` was routed to B, whatever trailing args rode along. */
+function resumeWasRequested(storedId: string): boolean {
+  return vi
+    .mocked(requestGatewayForAgent)
+    .mock.calls.some(
+      ([connection, profile, rpc, params]) =>
+        connection === 'connection-B' &&
+        profile === 'default' &&
+        rpc === 'session.resume' &&
+        (params as { session_id?: string } | undefined)?.session_id === storedId
+    )
+}
+
 // Real prompt hooks, cache, ownership router, and dispatcher; only the external
 // gateway edge is substituted. No test injects a corrupted ownership mapping.
 vi.mock('@/store/gateway', async original => ({
@@ -371,14 +384,9 @@ it.each(recoveryCases)(
     await act(async () => {
       first.reject(new Error('session not found'))
     })
-    await waitFor(() =>
-      expect(requestGatewayForAgent).toHaveBeenCalledWith(
-        'connection-B',
-        'default',
-        'session.resume',
-        expect.objectContaining({ session_id: 'stored-B' })
-      )
-    )
+    // PC overlay: session.resume carries a longer request timeout as trailing
+    // args, so match the resume by its routing/method/params, not positionally.
+    await waitFor(() => expect(resumeWasRequested('stored-B')).toBe(true))
 
     if (expiredRecovery) {
       expect(requestGatewayForAgent).toHaveBeenCalledWith('connection-B', 'default', method, {
@@ -521,12 +529,7 @@ it.each(rebuiltRuntimeCases)(
     })
 
     if (recover) {
-      expect(requestGatewayForAgent).toHaveBeenCalledWith(
-        'connection-B',
-        'default',
-        'session.resume',
-        expect.objectContaining({ session_id: 'stored-B-tip' })
-      )
+      expect(resumeWasRequested('stored-B-tip')).toBe(true)
     }
 
     expect($activeSessionId.get()).toBe(runtimeId)

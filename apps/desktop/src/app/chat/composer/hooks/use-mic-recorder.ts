@@ -285,8 +285,10 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
     let stream: MediaStream
 
     try {
+      // autoGainControl keeps a quiet mic's speech above the VAD threshold
+      // (mirrors the barge-in monitor and the wake-word capture).
       stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true }
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
       })
     } catch (error) {
       throw micError(error, copy)

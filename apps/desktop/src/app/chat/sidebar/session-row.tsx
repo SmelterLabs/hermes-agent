@@ -171,10 +171,11 @@ function SidebarSessionRowImpl({
   // Pinned metadata occupies the actions slot and swaps out for the kebab on
   // hover, so the row reserves the same width either way and never reflows.
   const pinnedAge = rowMeta.includes('updated')
-  // The default profile has no mark worth spending a row slot on — a chip on
-  // every row that says "the normal one" is noise. Named profiles only.
-  const hasProfileTag = normalizeProfileKey(session.profile) !== 'default'
-  const pinnedProfile = hasProfileTag && rowMeta.includes('profile')
+  // Clyde is the machine owner, not an anonymous "default" profile. Keep his
+  // identity visible on every session he owns; named-profile chips remain
+  // opt-in unless the sidebar is aggregating profiles.
+  const isDefaultProfile = normalizeProfileKey(session.profile) === 'default'
+  const pinnedProfile = rowMeta.includes('profile')
   // The branch's PR, if the row was asked to show one. A selector, not a plain
   // useStore: a repo's PRs land as a single map write, and only the rows on
   // those branches should repaint.
@@ -205,8 +206,11 @@ function SidebarSessionRowImpl({
   // to the left of the kebab's own column: never flush right, never swapping.
   const trailing: { key: string; node: React.ReactNode }[] = []
 
-  if ((showProfile || pinnedProfile) && hasProfileTag) {
-    trailing.push({ key: 'profile', node: <ProfileTag profile={session.profile} /> })
+  if (isDefaultProfile || showProfile || pinnedProfile) {
+    trailing.push({
+      key: 'profile',
+      node: <ProfileTag connectionId={session.connection_id} profile={session.profile} />
+    })
   }
 
   if (pr) {

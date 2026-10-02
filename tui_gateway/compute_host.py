@@ -254,6 +254,8 @@ class ComputeHost:
                 session.update(running=True, _turn_cancel_requested=False, last_active=time.time())
                 server._start_inflight_turn(session, inflight)
                 turn_started_at = time.time()
+                session["_compute_host_activity_generation_at_start"] = getattr(
+                    session.get("agent"), "_turn_liveness_activity_generation", 0)
             self._reply("turn.started", sid, request_id, started_ns=now_ns())
             with contextlib.suppress(Exception):
                 server._ensure_session_db_row(session)
@@ -306,7 +308,16 @@ class ComputeHost:
             summary = session["agent"].get_activity_summary()
             stamped_at = summary.get("last_activity_at")
             elapsed = summary.get("seconds_since_activity")
-            if stamped_at is not None and stamped_at >= started_at and elapsed is not None and elapsed >= 0:
+            generation = getattr(session["agent"], "_turn_liveness_activity_generation", None)
+            initial_generation = session.get("_compute_host_activity_generation_at_start")
+            # Wall-clock ticks can tie on Windows. Only a new activity write
+            # belongs to this turn; an old timestamp equal to admission does not.
+            progressed = (
+                generation > initial_generation
+                if isinstance(generation, int) and isinstance(initial_generation, int)
+                else stamped_at is not None and stamped_at > started_at
+            )
+            if progressed and stamped_at is not None and stamped_at >= started_at and elapsed is not None and elapsed >= 0:
                 activity_ns = now_ns() - int(elapsed * 1_000_000_000)
         except Exception:
             logging.getLogger(__name__).debug("compute host activity unavailable sid=%s", sid, exc_info=True)
@@ -547,6 +558,10 @@ def _default_workers() -> int:
 
 
 def run_host(stdin: Any = None, stdout: Any = None) -> None:
+    # Configure Windows stdio before the control reader starts. A first-turn
+    # gateway import must not reconfigure a stream another thread is reading.
+    import hermes_bootstrap  # noqa: F401
+
     os.environ["HERMES_COMPUTE_HOST_CHILD"] = "1"
     # JSONL framing is byte-oriented; avoid text-stream read-ahead on Windows pipes.
     stdin = stdin if stdin is not None else getattr(sys.stdin, "buffer", sys.stdin)

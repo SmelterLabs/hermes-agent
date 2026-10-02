@@ -1873,6 +1873,9 @@ export async function ensureGatewayForAgent(
   // activation would fail (#89622).
   entry.activationLeaseUntil = Date.now() + ACTIVATION_LEASE_MS
 
+  // Electron may have replaced the exact registry backend while this renderer
+  // still holds an open WebSocket to the dashboard that died. Retire the
+  // renderer half too so openSecondary binds to the recovered descriptor.
   if (!isOpen(entry.gateway)) {
     clearTimer(entry)
     entry.reconnectAttempt = 0
@@ -2167,8 +2170,27 @@ export function reconnectSecondaryGateways({ forceOpenSockets = false }: { force
       entry.gateway.close()
     }
 
-    entry.reconnectAttempt = 0
-    clearTimer(entry)
+    if (forceOpenSockets) {
+      // Genuine new-connectivity signal (power resume, network online,
+      // manual reconnect): the world changed, so the ladder's history is
+      // stale — reset it and dial now.
+      entry.reconnectAttempt = 0
+      clearTimer(entry)
+      void reconnectSecondary(entry)
+
+      continue
+    }
+
+    // Ambient nudge (window focus/visibility). While the backoff loop is
+    // already armed or mid-dial, let it work: clearing the timer and dialing
+    // immediately here turned every focus event into a fresh dial against a
+    // cold-booting backend — the observed 24-sockets-in-one-second storms,
+    // where clicking made recovery WORSE (#94769). Only a stalled loop (no
+    // timer, no dial in flight) gets nudged, and at its CURRENT rung.
+    if (entry.reconnectTimer !== null || entry.reconnecting) {
+      continue
+    }
+
     void reconnectSecondary(entry)
   }
 }

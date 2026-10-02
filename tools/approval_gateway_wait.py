@@ -24,7 +24,10 @@ logger = logging.getLogger("tools.approval")
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("acknowledged", "cancelled", "data", "event", "expired", "reason", "result", "settle")
+    __slots__ = (
+        "acknowledged", "cancelled", "data", "dispatch_snapshot", "event", "expired",
+        "notify_pending", "reason", "result", "settle",
+    )
 
     def __init__(self, data: dict):
         self.event = threading.Event()
@@ -42,6 +45,14 @@ class _ApprovalEntry:
         self.cancelled: str | None = None
         # The prompt timed out unanswered; followers woken by its event adopt that timeout.
         self.expired = False
+        # Queue resolvers may observe an entry before the notifier has returned. Keep
+        # that resolution attached to the entry until dispatch finishes, so a fast
+        # /approve cannot make the worker report a false notify failure.
+        self.notify_pending = False
+        # Captured under the approval lock immediately before the external
+        # notifier is called. The generation/identity pair is reconciled after
+        # the callback returns.
+        self.dispatch_snapshot = None
 
 
 def _poll_event(event: threading.Event, session_key: str, *, interrupt_log: str) -> str:
@@ -103,7 +114,10 @@ def _hook_choice(resolved: bool, choice: str | None, extra: dict) -> str:
     return (choice or "timeout") if resolved else "timeout"
 
 
-def _await_coalesced_leader(session_key: str, leader, payload: dict):
+def _await_coalesced_leader(
+    session_key: str, leader, payload: dict, *,
+    api_server_capability=None, require_api_server_capability: bool = False,
+):
     """Wait on an already-pending identical approval instead of re-prompting.
     Adopts the leader's decision: ``session``/``always`` → approval (same dict
     shape as a direct resolution; persistence stays the caller's and is
@@ -127,6 +141,30 @@ def _await_coalesced_leader(session_key: str, leader, payload: dict):
     else:
         choice = leader.result
         resolved = choice is not None
+    from tools import approval as _approval
+    validate_registration = require_api_server_capability or api_server_capability is not None
+    with _approval._lock:
+        cancelled = leader.cancelled
+        snapshot = leader.dispatch_snapshot
+        registration_live = (
+            snapshot is None
+            or _approval._gateway_notify_registration_live_locked(
+                session_key, snapshot,
+                capability=api_server_capability,
+                require_capability=require_api_server_capability,
+            )
+        )
+    if cancelled or not registration_live:
+        if cancelled and not validate_registration:
+            if not isinstance(cancelled, str):
+                cancelled = "the turn ended before the prompt was answered"
+            return _finish(
+                payload, resolved, None, getattr(leader, "reason", None),
+                coalesced=True, cancelled=cancelled,
+            )
+        return _finish(
+            payload, False, None, None, notify_failed=True, coalesced=True,
+        )
     if choice == "once":
         # The post hook fires for the fresh prompt's own lifecycle, not here.
         return None
@@ -134,13 +172,15 @@ def _await_coalesced_leader(session_key: str, leader, payload: dict):
     return _finish(payload, resolved, choice, getattr(leader, "reason", None), coalesced=True, **extra)
 
 
-def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *, surface: str = "gateway") -> dict:
+def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *, surface: str = "gateway",
+                            api_server_capability=None,
+                            require_api_server_capability: bool = False) -> dict:
     """Enqueue *approval_data*, notify the user, and block until resolved or timed
     out. Shared by the terminal command guard, the execute_code guard, the plugin
     escalation gate, and MCP elicitation. Returns ``{"resolved", "choice",
-    "reason"}`` or ``{"resolved": False, "choice": None, "notify_failed": True}``
-    when the notify callback raised. Persisting the choice and building the
-    tool-facing result stay with the caller.
+    "reason"}`` or ``{"resolved": False, "choice": None, "notify_failed": True}`` when the notify callback raises or its exact
+    registration is lost during setup. Persisting the choice and building the tool-facing result stay with the
+    caller.
 
     Identical concurrent approvals (same command text + pattern-key set) are
     coalesced: parallel tool calls would otherwise fire N identical prompts
@@ -149,6 +189,27 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     the leader, so the followers fall through to ONE fresh prompt they coalesce on."""
     from tools import approval as _approval
     from agent.terminal_approval_batch import approval_published, preparing_terminal_approval, register_prepared_approval
+
+    def _notify_failed() -> dict:
+        return {"resolved": False, "choice": None, "notify_failed": True}
+
+    # Ordinary legacy callers may pass an unregistered callback directly. Any
+    # execution-owned lease, however, always takes the authoritative locked path.
+    validate_registration = require_api_server_capability or api_server_capability is not None
+
+    def _registration_matches_locked() -> bool:
+        return _approval._gateway_notify_registration_matches_locked(
+            session_key, notify_cb, capability=api_server_capability,
+            require_capability=validate_registration,
+        )
+
+    # This fast check keeps the common stale-callback path out of the queue code. The
+    # locked checks below are authoritative and close the race between this read and append.
+    if validate_registration and not _approval._gateway_notify_registration_matches(
+        session_key, notify_cb, capability=api_server_capability,
+        require_capability=require_api_server_capability,
+    ):
+        return _notify_failed()
 
     primary_key = approval_data.get("pattern_key", "")
     if surface == "gateway":
@@ -162,6 +223,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     }
     keys = list(approval_data.get("pattern_keys") or [])
     entry = _ApprovalEntry(approval_data)
+    entry.notify_pending = True
 
     def _enqueue() -> None:
         register_prepared_approval(session_key, entry)
@@ -171,8 +233,12 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     # miss each other, both enqueue and the user gets duplicate prompts. A ``once`` releases the
     # followers to prompt for themselves; they re-coalesce behind whichever re-prompts first, so the
     # user still sees one prompt at a time (the answered leader is already off the queue).
+    # Registration and queue insertion are one decision too: cleanup can either win before the
+    # locked block (no entry is enqueued) or after it (unregister pops and wakes it).
     while True:
         with _approval._lock:
+            if validate_registration and not _registration_matches_locked():
+                return _notify_failed()
             leader = None
             if not preparing_terminal_approval():
                 leader = next((e for e in _approval._gateway_queues.get(session_key, [])
@@ -181,7 +247,16 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             if leader is None:
                 _enqueue()
                 break
-        adopted = _await_coalesced_leader(session_key, leader, payload)
+        if validate_registration and not _approval._gateway_notify_registration_matches(
+            session_key, notify_cb, capability=api_server_capability,
+            require_capability=require_api_server_capability,
+        ):
+            return _notify_failed()
+        adopted = _await_coalesced_leader(
+            session_key, leader, payload,
+            api_server_capability=api_server_capability,
+            require_api_server_capability=require_api_server_capability,
+        )
         if adopted is not None:
             return adopted
 
@@ -220,34 +295,126 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
                 logger.debug("approval settle hook failed", exc_info=True)
         return choice
 
+    def _fail_entry() -> None:
+        """Cancel this dispatch and wake any coalesced followers.
+
+        A leader's notify callback can fail after followers have attached to its
+        event.  Removing the leader alone would strand those followers until the
+        approval timeout; cancellation is an authorization failure and must wake
+        every waiter immediately.
+        """
+        with _approval._lock:
+            entry.cancelled = True
+            entry.notify_pending = False
+            queue = _approval._gateway_queues.get(session_key, [])
+            if entry in queue:
+                queue.remove(entry)
+            if not queue:
+                _approval._gateway_queues.pop(session_key, None)
+            entry.event.set()
+
     from tools.human_input_hooks import human_input_request
     with human_input_request("approval", prompt=payload["command"], session_key=session_key) as human:
         # Plugins hear about the request before the gateway does (real-time observers).
         _ctx._fire_approval_hook("pre_approval_request", **payload)
-        # Bridges sync agent thread → async gateway.
+        # Phase 1: validate the exact callback/lease and queue entry while holding
+        # the registry lock, then capture a generation.  The callback is never
+        # called while this lock is held: it may synchronously resolve, unregister,
+        # or otherwise re-enter the approval subsystem.
+        with _approval._lock:
+            dispatch_snapshot = _approval._gateway_notify_dispatch_snapshot_locked(
+                session_key, notify_cb, capability=api_server_capability,
+                require_capability=validate_registration,
+            )
+            dispatch_allowed = (
+                dispatch_snapshot is not None
+                and not entry.cancelled
+                and entry in _approval._gateway_queues.get(session_key, [])
+            )
+            if dispatch_allowed:
+                entry.dispatch_snapshot = dispatch_snapshot
+        if not dispatch_allowed:
+            _fail_entry()
+            _ctx._fire_approval_hook("post_approval_response", **payload, choice="notify_failed")
+            human.outcome = "notify_failed"
+            return _notify_failed()
+
+        # Phase 2: external notification, outside the global approval lock.
+        # /approval and cleanup can therefore progress even if a plugin/network
+        # callback is slow.  Their mutations are reconciled atomically below.
         try:
-            notify_cb(dict(entry.data))
+            dispatch_snapshot[0](dict(entry.data))
             approval_published()
         except Exception as exc:
             logger.warning("Gateway approval notify failed: %s", exc)
-            _drop_entry("notify_failed")
+            _fail_entry()
             _ctx._fire_approval_hook("post_approval_response", **payload, choice="notify_failed")
             human.outcome = "notify_failed"
-            return {"resolved": False, "choice": None, "notify_failed": True}
+            return _notify_failed()
 
-        state = _poll_event(entry.event, session_key,
-                            interrupt_log="Approval wait interrupted — returning deny for session %s")
+        # Phase 3: reconcile the exact registration and entry after the callback.
+        # A synchronous resolver is valid and leaves a notify-in-flight entry in the
+        # queue until this point. Revocation/unregister/replacement instead makes the
+        # snapshot stale or marks the entry cancelled, so no result can authorize it.
+        with _approval._lock:
+            registration_live = _approval._gateway_notify_dispatch_live_locked(
+                session_key, entry, dispatch_snapshot,
+                capability=api_server_capability,
+                require_capability=validate_registration,
+            )
+            entry.notify_pending = False
+            listener_cancelled = entry.cancelled
+        if (not registration_live or listener_cancelled) and (
+            validate_registration or not listener_cancelled
+        ):
+            _fail_entry()
+            _ctx._fire_approval_hook("post_approval_response", **payload, choice="notify_failed")
+            human.outcome = "notify_failed"
+            return _notify_failed()
+
+        state = _poll_event(
+            entry.event, session_key,
+            interrupt_log="Approval wait interrupted — returning deny for session %s",
+        )
         cancelled = _cancel_cause(state, entry)
-        if state == "interrupted":
-            # Coalesced followers wake with the cause instead of a deny nobody issued.
-            entry.cancelled = cancelled
-            entry.event.set()
+        with _approval._lock:
+            # After dispatch, a legitimate resolver may remove the entry from the
+            # queue, so verify registration/cancellation separately from membership.
+            registration_live = _approval._gateway_notify_registration_live_locked(
+                session_key, dispatch_snapshot,
+                capability=api_server_capability,
+                require_capability=validate_registration,
+            )
+            listener_cancelled = entry.cancelled
+            if state == "interrupted" and registration_live and not listener_cancelled:
+                # Our own decision stays a fail-closed deny; coalesced followers wake with the
+                # cause instead of a deny nobody issued.
+                entry.result = "deny"
+                entry.cancelled = cancelled or "turn interrupted"
+                cancelled = entry.cancelled
+                entry.event.set()
+        if not validate_registration and listener_cancelled:
+            # Ordinary gateway teardown is a withdrawn prompt, not a user deny.
+            # Older tests and direct callers may leave a boolean marker; keep the
+            # historical stable cause instead of exposing ``True`` in the result.
+            if not isinstance(cancelled, str):
+                cancelled = "the turn ended before the prompt was answered"
+            choice = _drop_entry(state)
+            resolved = state != "timeout" or choice is not None
+            human.outcome = _hook_choice(resolved, choice, {"cancelled": cancelled})
+            return _finish(payload, resolved, choice, entry.reason, cancelled=cancelled)
+        if listener_cancelled or not registration_live:
+            _fail_entry()
+            _ctx._fire_approval_hook("post_approval_response", **payload, choice="notify_failed")
+            human.outcome = "notify_failed"
+            return _notify_failed()
+        # ``_drop_entry`` reads the committed choice under the approval lock as it leaves the queue:
+        # a choice that landed in the gap between the deadline check and removal is an answer, not a
+        # timeout (#112548) — the same first-settlement rule as server_requests.send().
         choice = _drop_entry(state)
         if state == "interrupted":
             # Our own decision stays a fail-closed deny.
             choice = "deny"
-        # A choice that landed in the gap between the deadline check and leaving the queue is an answer,
-        # not a timeout (#112548) — the same first-settlement rule as server_requests.send().
         resolved = state != "timeout" or choice is not None
         extra = {"cancelled": cancelled} if cancelled else {}
         human.outcome = _hook_choice(resolved, choice, extra)

@@ -31,6 +31,12 @@ export interface FleetGroup {
   named: FleetAgent[]
 }
 
+// Local overlay preference: show only the selected box's profiles. The
+// statusbar switcher still hops gateways. Keep the upstream fleet grouping
+// implementation available, but do not restore its full rail by default.
+// Fleet-specific tests force the flag on to keep that dormant path covered.
+export const FLEET_RAIL_ENABLED = false
+
 export const DEFAULT_PROFILE = 'default'
 
 export function fleetRouteKey(connectionId: string, profile: string): string {

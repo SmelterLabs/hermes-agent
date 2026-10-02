@@ -7,6 +7,7 @@ OpenAI-compatible frontend connects at http://localhost:8642/v1 with API_SERVER_
 """
 
 import asyncio
+import copy
 import concurrent.futures
 import errno
 import hashlib
@@ -165,6 +166,67 @@ from hermes_state_errors import SessionActiveWriteGuardError
 
 
 logger = logging.getLogger(__name__)
+
+
+def _maybe_post_turn_compress(agent: Any, result: Any, session_id: Optional[str]) -> None:
+    """Compact an over-threshold API transcript after its response has settled.
+
+    API-server agents are created for one request at a time, so their next
+    request otherwise discovers an oversized persisted transcript only during
+    turn-start preflight.  The normal finalizer has already flushed this turn
+    before this runs.  A daemon worker uses the same compressor gate and
+    durable compression lease as preflight. ``archive_and_compact`` preserves
+    rows written after its watermark while the summary runs.
+    """
+    if not isinstance(result, dict) or result.get("failed") or result.get("interrupted"):
+        return
+    if not session_id or not getattr(agent, "compression_enabled", False):
+        return
+    if not getattr(agent, "compression_in_place", True):
+        # A background rotation cannot update a REST client that is still
+        # holding the parent session id.
+        return
+    if getattr(agent, "api_mode", None) == "codex_app_server":
+        return
+    if getattr(agent, "_session_db", None) is None:
+        return
+    messages = result.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return
+    compressor = getattr(agent, "context_compressor", None)
+    should_compress = getattr(compressor, "should_compress", None)
+    compress = getattr(agent, "_compress_context", None)
+    if not callable(should_compress) or not callable(compress):
+        return
+    try:
+        from agent.model_metadata import estimate_request_tokens_rough
+        system_prompt = str(getattr(agent, "_cached_system_prompt", "") or "")
+        approx_tokens = estimate_request_tokens_rough(
+            messages, system_prompt=system_prompt, tools=getattr(agent, "tools", None) or None)
+        if not should_compress(approx_tokens):
+            return
+    except Exception:
+        logger.debug("Post-turn API compaction preflight failed for session %s", session_id, exc_info=True)
+        return
+
+    # Context variables carry the selected profile's Hermes home and secret scope
+    # into a worker thread; without this, named-profile compression resolves the
+    # root config and credentials instead.
+    messages_snapshot = copy.deepcopy(messages)
+    worker_context = copy_context()
+
+    def _worker() -> None:
+        try:
+            # The cached prompt is already fully built.  Passing it back into
+            # _compress_context would cause the prompt builder to nest it.
+            compress(messages_snapshot, None, approx_tokens=approx_tokens, task_id=session_id)
+        except Exception:
+            logger.warning("Post-turn API compaction failed for session %s", session_id, exc_info=True)
+
+    threading.Thread(
+        target=worker_context.run, args=(_worker,), daemon=True,
+        name=f"api-post-turn-compress-{session_id[:24]}",
+    ).start()
 
 
 def _browser_controller_ws_sender(ws, loop, *, wait_timeout: float = 10.0):
@@ -1096,7 +1158,10 @@ def _run_route_delegate(name: str):
     return _handler
 
 
-class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+from gateway.platforms.api_server_session_runtime import SessionRuntimeMixin
+
+
+class APIServerAdapter(SessionRuntimeMixin, OpenAICompatRoutesMixin, BasePlatformAdapter):
     """aiohttp server routing OpenAI-format requests through hermes-agent's AIAgent."""
 
     # Stateless request/response (``send()`` is a stub): async-delivery tools must not promise
@@ -1141,6 +1206,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # clients that choke on named events (#12020). Default on.
         self._tool_progress_events: bool = _coerce_request_bool(
             extra.get("tool_progress_events"), default=True)
+        self._init_session_runtime(extra)
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
@@ -1670,6 +1736,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
+            ("GET", "/api/pinned-sessions", self._handle_pinned_sessions),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -2355,6 +2422,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "session_model_lock" if confirmed_runtime_lock
             else "session_model_override" if session_override
             else "raw_request" if route or request_model or request_provider else "global")
+        from hermes_constants import get_hermes_home
+        agent._hermes_profile_home_pin = str(get_hermes_home())
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
@@ -2937,7 +3006,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "message_count", "tool_call_count", "input_tokens", "output_tokens",
             "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "estimated_cost_usd",
             "actual_cost_usd", "api_call_count", "parent_session_id", "last_active", "preview",
-            "_lineage_root_id", "pinned", "archived", "hidden")
+            "_lineage_root_id", "pinned", "archived", "hidden", "cwd")
         payload = {key: session.get(key) for key in safe_keys if key in session}
         # SQLite stores the flags as 0/1.
         payload.update(
@@ -2970,7 +3039,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         safe_keys = (
             "id", "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name",
             "timestamp", "token_count", "finish_reason", "reasoning", "reasoning_content",
-            "display_kind")
+            "display_kind", "display_metadata")
         return {key: message.get(key) for key in safe_keys if key in message}
 
     async def _read_json_body(self, request: web.Request) -> tuple[dict[str, Any], Optional[web.Response]]:
@@ -3087,6 +3156,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         system_prompt = body.get("system_prompt")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return _error_response("system_prompt must be a string", 400, code="invalid_system_prompt")
+        session_cwd = None
+        if body.get("cwd") is not None:
+            session_cwd, cwd_error = self._validate_session_cwd(body.get("cwd"))
+            if cwd_error is not None:
+                return _error_response(cwd_error, 400, code="invalid_session_cwd")
+        else:
+            session_cwd = self._profile_default_session_cwd()
         source = self._normalize_session_source(body.get("source") or "api_server")
         runtime_request = self._session_runtime_request_from_body(body)
         lock_error = self._runtime_lock_error(runtime_request)
@@ -3112,10 +3188,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 return None, "exists"
             conn.execute(
                 """INSERT INTO sessions (
-                   id, source, model, model_config, system_prompt, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                   id, source, model, model_config, system_prompt, cwd, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (session_id, source, model_name, json.dumps(model_config) if model_config else None,
-                 system_prompt, time.time()))
+                 system_prompt, session_cwd, time.time()))
             if title is not None:
                 clean_title = db.sanitize_title(str(title))
                 if clean_title:
@@ -3273,6 +3349,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if await asyncio.to_thread(db.get_session, fork_id):
             return _error_response(f"Session already exists: {fork_id}", 409, code="session_exists")
 
+        fork_cwd, cwd_error = self._session_cwd_for_run(source)
+        if cwd_error is not None:
+            return cwd_error
+
         # CLI /branch semantics: create the child, then end the original as branched (child first, so
         # a failed create never leaves the source ended with no fork, #11030).
         # ``_branched_from`` is the durable branch marker (same as CLI /branch): with the child created
@@ -3281,7 +3361,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         await asyncio.to_thread(
             db.create_session, fork_id, "api_server", model=source.get("model"),
             system_prompt=source.get("system_prompt"), parent_session_id=source_id,
-            model_config={"_branched_from": source_id})
+            model_config={"_branched_from": source_id}, cwd=fork_cwd or None)
         await asyncio.to_thread(db.end_session, source_id, "branched")
         messages = await asyncio.to_thread(db.get_messages, source_id)
         await asyncio.to_thread(db.replace_messages, fork_id, messages)
@@ -3311,6 +3391,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session, err = await self._get_existing_session_or_404(session_id)
         if err:
             return None, err
+        session_cwd, cwd_error = self._session_cwd_for_run(session)
+        if cwd_error is not None:
+            return None, cwd_error
         body, err = await self._read_json_body(request)
         if err:
             return None, err
@@ -3357,6 +3440,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         run_kwargs = dict(
             user_message=user_message, ephemeral_system_prompt=system_prompt, session_id=session_id,
             gateway_session_key=gateway_session_key, route=route, session_model=session_model,
+            session_cwd=session_cwd,
+            warm_runtime=(self._pinned_sessions.runtime_for_session(session_id)
+                          if self._pinned_sessions else None),
             requested_runtime=runtime_request.get("requested") or {},
             route_source=runtime_request.get("route_source") or "global",
             confirmed_runtime_lock=lock_active, turn_author=turn_author,
@@ -4065,7 +4151,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _bind_api_server_session(
         *, chat_id: str = "", session_key: str = "", session_id: str = "", profile: str = "",
         browser_control_principal: str = "", browser_control_transport_family: str = "",
-        session_history_delivery: str = "") -> list:
+        session_history_delivery: str = "", cwd: str = "") -> list:
         """Bind an API turn with push disabled and history delivery default-denied.
 
         Only routes whose continuation reads SessionDB may pass "1". An omitted
@@ -4079,7 +4165,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             platform="api_server", chat_id=chat_id, session_key=session_key, session_id=session_id,
             profile=profile, browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family,
-            async_delivery=False, cron_session="", session_history_delivery=session_history_delivery)
+            async_delivery=False, cron_session="", session_history_delivery=session_history_delivery, cwd=cwd)
 
     def _turn_runtime_metadata(
         self, agent: Any, *, route: Optional[dict[str, Any]], requested_runtime: Optional[dict[str, Any]],
@@ -4148,6 +4234,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             if isinstance(result, dict):
                 result["runtime"] = runtime
             usage["runtime"] = runtime
+        _maybe_post_turn_compress(agent, result, _eff_sid if isinstance(_eff_sid, str) else session_id)
         return result, usage
 
     async def _run_agent(
@@ -4159,6 +4246,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         gateway_session_key: Optional[str] = None, requested_model: Optional[str] = None,
         requested_provider: Optional[str] = None, model_options: Optional[dict[str, Any]] = None,
         route: Optional[dict[str, Any]] = None, session_model: Optional[str] = None,
+        session_cwd: str = "", warm_runtime: Optional[Any] = None,
         requested_runtime: Optional[dict[str, Any]] = None, route_source: str = "global",
         confirmed_runtime_lock: bool = False, bind_declared_conversation: bool = False,
         request_id: Optional[str] = None, history_from_session: bool = False, run_owner_scope=None,
@@ -4210,21 +4298,50 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     session_id=session_id or "", profile=request_profile or "",
                     browser_control_principal=request_browser_control_principal,
                     browser_control_transport_family=request_browser_control_transport_family,
-                    session_history_delivery=session_history_delivery)
+                    session_history_delivery=session_history_delivery, cwd=session_cwd or "")
                 agent = None
                 from agent.notification_presentation import notification_turn
                 from gateway.warning_notifications import diagnostic_turn_muted
                 muted = diagnostic_turn_muted({"notification_category": notification_category}, "api_server")
-                try:
-                    agent = self._create_agent(
+                warm_lock_held = False
+                warm_turn_ok = False
+                effective_gateway_session_key = gateway_session_key or session_id or ""
+
+                def build_requested_agent():
+                    return self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt, session_id=session_id,
                         stream_delta_callback=stream_delta_callback, tool_progress_callback=tool_progress_callback,
                         tool_start_callback=tool_start_callback, tool_complete_callback=tool_complete_callback,
                         interim_assistant_callback=interim_assistant_callback,
                         reasoning_callback=reasoning_callback, status_callback=status_callback,
-                        gateway_session_key=gateway_session_key, requested_model=requested_model,
+                        gateway_session_key=effective_gateway_session_key, requested_model=requested_model,
                         requested_provider=requested_provider, model_options=model_options, route=route,
                         session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
+
+                signature = self._pinned_agent_signature(
+                    ephemeral_system_prompt=ephemeral_system_prompt, session_id=session_id,
+                    gateway_session_key=effective_gateway_session_key,
+                    requested_model=requested_model, requested_provider=requested_provider,
+                    model_options=model_options, route=route, session_model=session_model,
+                    session_cwd=session_cwd, confirmed_runtime_lock=confirmed_runtime_lock)
+                try:
+                    if warm_runtime is not None:
+                        warm_runtime.turn_lock.acquire()
+                        warm_lock_held = True
+                        agent = self._pinned_sessions.ensure_agent(
+                            warm_runtime,
+                            expected_provider=(requested_runtime or {}).get("provider") or "",
+                            expected_model=(requested_runtime or {}).get("model") or "",
+                            expected_signature=signature, agent_builder=build_requested_agent,
+                            stream_delta_callback=stream_delta_callback,
+                            tool_progress_callback=tool_progress_callback,
+                            tool_start_callback=tool_start_callback,
+                            tool_complete_callback=tool_complete_callback,
+                            interim_assistant_callback=interim_assistant_callback,
+                            reasoning_callback=reasoning_callback,
+                            status_callback=status_callback)
+                    else:
+                        agent = build_requested_agent()
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     if resume_unanswered_turn:
@@ -4285,6 +4402,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         # Project presentation only after finishing the source outcome. Keep
                         # the agent's result, transcript, failure flags and usage intact.
                         result = {**result, "_notification_presentation_suppressed": True}
+                    warm_turn_ok = True
                     return result, usage
                 except _ProviderAuthResolutionError as exc:
                     # Typed provider-auth failure only, handled once for every caller in
@@ -4321,6 +4439,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         if bind_declared_conversation:
                             self._bind_declared_conversation(
                                 getattr(agent, "session_id", None) or session_id, gateway_session_key)
+                    if warm_runtime is not None and warm_lock_held:
+                        try:
+                            self._pinned_sessions.note_turn_result(warm_runtime, agent, ok=warm_turn_ok)
+                        finally:
+                            warm_runtime.turn_lock.release()
                     clear_session_vars(tokens)
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
@@ -4551,6 +4674,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # heartbeat loop updates last_heartbeat/metrics_today (#52323).
             self._publish_runtime_status()
             self._track_background_task(asyncio.create_task(self._heartbeat_loop()))
+            self._start_pinned_session_hydration()
             logger.info(
                 "[%s] API server listening on http://%s:%d (model: %s)",
                 self.name, self._host, self._port, self._model_name)

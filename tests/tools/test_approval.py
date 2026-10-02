@@ -1,6 +1,9 @@
 """Tests for the dangerous command approval module."""
 
+import json
 import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -1011,6 +1014,1438 @@ class TestWebhookApprovalExclusion:
         result = check_execute_code_guard("import os", "local")
         assert result["approved"] is False
         assert "approvals.unattended_mode" in result["message"]
+
+
+class TestApiServerApprovalListener:
+    """An API run may use the gateway wait only while its own notifier is live."""
+
+    @staticmethod
+    def _bind_api_context(session_key, capability=None):
+        from gateway.session_context import set_session_vars
+        from tools.approval_context import set_current_api_server_run_capability, set_current_session_key
+
+        return (
+            set_current_session_key(session_key),
+            set_session_vars(platform="api_server", session_key=session_key),
+            (set_current_api_server_run_capability(capability) if capability is not None else None),
+        )
+
+    @staticmethod
+    def _reset_api_context(session_token, session_tokens, capability_token=None):
+        from gateway.session_context import clear_session_vars
+        from tools.approval_context import reset_current_api_server_run_capability, reset_current_session_key
+
+        if capability_token is not None:
+            reset_current_api_server_run_capability(capability_token)
+        clear_session_vars(session_tokens)
+        reset_current_session_key(session_token)
+
+    @staticmethod
+    def _lease(session_key):
+        return approval_module.issue_api_run_approval_lease(session_key, owner=object())
+
+    def test_presence_requires_listener_for_exact_api_run_key(self, monkeypatch):
+        from gateway.session_context import reset_session_vars
+        from tools.approval import register_gateway_notify, unregister_gateway_notify
+
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        reset_session_vars()
+        session_key = "api-listener-exact"
+        other_key = "api-listener-other"
+        capability = self._lease(session_key)
+        session_token, session_tokens, capability_token = self._bind_api_context(session_key, capability)
+        try:
+            assert approval_module._presence()[2] is False
+            register_gateway_notify(other_key, lambda _data: None)
+            assert approval_module._presence()[2] is False
+            # A matching caller-controlled key alone is not an API-run capability.
+            register_gateway_notify(session_key, lambda _data: None)
+            assert approval_module._presence()[2] is False
+            register_gateway_notify(session_key, lambda _data: None, capability=capability)
+            assert approval_module._presence()[2] is True
+        finally:
+            unregister_gateway_notify(session_key, capability=capability)
+            unregister_gateway_notify(other_key)
+            self._reset_api_context(session_token, session_tokens, capability_token)
+            reset_session_vars()
+
+    @pytest.mark.parametrize("gate", ["terminal", "execute_code"])
+    def test_ordinary_api_context_cannot_borrow_run_listener(self, monkeypatch, gate):
+        """A client-chosen session key must not borrow another run's listener."""
+        from gateway.session_context import reset_session_vars
+        from tools.approval import (
+            check_all_command_guards,
+            check_execute_code_guard,
+            register_gateway_notify,
+            unregister_gateway_notify,
+        )
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_permanent_approved", set())
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(approval_context, "_get_unattended_approval_mode", lambda: "deny")
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        reset_session_vars()
+        run_key = "run-owned-by-another-execution"
+        capability = self._lease(run_key)
+        callbacks = []
+        register_gateway_notify(run_key, lambda data: callbacks.append(data), capability=capability)
+        session_token, session_tokens, capability_token = self._bind_api_context(run_key)
+        try:
+            result = (
+                check_all_command_guards("rm -rf /tmp/api-collision", "local")
+                if gate == "terminal"
+                else check_execute_code_guard("import os", "local")
+            )
+        finally:
+            self._reset_api_context(session_token, session_tokens, capability_token)
+            unregister_gateway_notify(run_key, capability=capability)
+            reset_session_vars()
+
+        assert callbacks == []
+        assert result["approved"] is False
+        assert "unattended" in result["message"].lower()
+        with approval_module._lock:
+            assert run_key not in approval_module._gateway_queues
+
+    @pytest.mark.parametrize("gate", ["terminal", "execute_code"])
+    def test_api_listener_cleanup_race_fails_closed_without_pending(self, monkeypatch, gate):
+        """Cleanup after capability detection must not create an unanswerable request."""
+        from gateway.session_context import reset_session_vars
+        from tools.approval import (
+            check_all_command_guards,
+            check_execute_code_guard,
+            register_gateway_notify,
+            unregister_gateway_notify,
+        )
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_permanent_approved", set())
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        reset_session_vars()
+        run_key = "run-cleanup-race"
+        capability = self._lease(run_key)
+        callbacks = []
+        register_gateway_notify(run_key, lambda data: callbacks.append(data), capability=capability)
+        session_token, session_tokens, capability_token = self._bind_api_context(run_key, capability)
+        original_presence = approval_module._presence
+
+        def stale_presence(approval_callback=None):
+            snapshot = original_presence(approval_callback)
+            # Deterministically model _execute_run cleanup winning after presence detection.
+            unregister_gateway_notify(run_key, capability=capability)
+            return snapshot
+
+        monkeypatch.setattr(approval_module, "_presence", stale_presence)
+        try:
+            result = (
+                check_all_command_guards("rm -rf /tmp/api-cleanup-race", "local")
+                if gate == "terminal"
+                else check_execute_code_guard("import os", "local")
+            )
+        finally:
+            self._reset_api_context(session_token, session_tokens, capability_token)
+            unregister_gateway_notify(run_key, capability=capability)
+            reset_session_vars()
+
+        assert callbacks == []
+        assert result["approved"] is False
+        assert "unattended" in result["message"].lower()
+        assert result.get("status") != "pending_approval"
+        with approval_module._lock:
+            assert run_key not in approval_module._gateway_queues
+            assert run_key not in approval_module._gateway_notify_cbs
+
+    @pytest.mark.parametrize("gate", ["terminal", "execute_code"])
+    def test_api_listener_cleanup_after_queue_before_notify_fails_closed(self, monkeypatch, gate):
+        """A cancellation between queue insertion and callback dispatch cannot orphan a request."""
+        from gateway.session_context import reset_session_vars
+        from tools.approval import (
+            check_all_command_guards,
+            check_execute_code_guard,
+            register_gateway_notify,
+            unregister_gateway_notify,
+        )
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_permanent_approved", set())
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        reset_session_vars()
+        run_key = f"run-queue-before-notify-{gate}"
+        capability = self._lease(run_key)
+        callbacks = []
+        register_gateway_notify(run_key, lambda data: callbacks.append(data), capability=capability)
+        session_token, session_tokens, capability_token = self._bind_api_context(run_key, capability)
+        original_hook = approval_context._fire_approval_hook
+
+        def cleanup_on_request(event_name, **kwargs):
+            if event_name == "pre_approval_request":
+                # _await_gateway_decision has inserted the entry, but has not
+                # dispatched notify_cb yet. This is the cancellation interleave.
+                unregister_gateway_notify(run_key, capability=capability)
+            original_hook(event_name, **kwargs)
+
+        monkeypatch.setattr(approval_context, "_fire_approval_hook", cleanup_on_request)
+        try:
+            result = (
+                check_all_command_guards("rm -rf /tmp/api-queue-race", "local")
+                if gate == "terminal"
+                else check_execute_code_guard("import os", "local")
+            )
+        finally:
+            self._reset_api_context(session_token, session_tokens, capability_token)
+            unregister_gateway_notify(run_key, capability=capability)
+            reset_session_vars()
+
+        assert callbacks == []
+        assert result["approved"] is False
+        assert "unattended" in result["message"].lower()
+        assert result.get("status") != "pending_approval"
+        with approval_module._lock:
+            assert run_key not in approval_module._gateway_queues
+            assert run_key not in approval_module._gateway_notify_cbs
+
+    @pytest.mark.parametrize("gate", ["terminal", "execute_code"])
+    def test_api_listener_cleanup_during_notify_fails_closed(self, monkeypatch, gate):
+        """Teardown after acquisition but during callback dispatch cannot leave a waiter live."""
+        from gateway.session_context import reset_session_vars
+        from tools.approval import (
+            check_all_command_guards,
+            check_execute_code_guard,
+            register_gateway_notify,
+            unregister_gateway_notify,
+        )
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_permanent_approved", set())
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        reset_session_vars()
+        run_key = f"run-notify-race-{gate}"
+        capability = self._lease(run_key)
+        callbacks = []
+        cleanup_threads = []
+
+        def cleanup():
+            unregister_gateway_notify(run_key, capability=capability)
+
+        def notify(data):
+            callbacks.append(data)
+            # The callback has been acquired and is now racing run cleanup.
+            cleanup_thread = threading.Thread(target=cleanup)
+            cleanup_threads.append(cleanup_thread)
+            cleanup_thread.start()
+
+        register_gateway_notify(run_key, notify, capability=capability)
+        session_token, session_tokens, capability_token = self._bind_api_context(run_key, capability)
+        try:
+            result = (
+                check_all_command_guards("rm -rf /tmp/api-notify-race", "local")
+                if gate == "terminal"
+                else check_execute_code_guard("import os", "local")
+            )
+        finally:
+            self._reset_api_context(session_token, session_tokens, capability_token)
+            for cleanup_thread in cleanup_threads:
+                cleanup_thread.join(timeout=2)
+            unregister_gateway_notify(run_key, capability=capability)
+            reset_session_vars()
+
+        assert len(callbacks) == 1
+        assert result["approved"] is False
+        assert "unattended" in result["message"].lower()
+        assert result.get("status") != "pending_approval"
+        with approval_module._lock:
+            assert run_key not in approval_module._gateway_queues
+            assert run_key not in approval_module._gateway_notify_cbs
+
+    @pytest.mark.parametrize("gate", ["terminal", "execute_code"])
+    def test_api_listener_cleanup_while_waiting_fails_closed(self, monkeypatch, gate):
+        """Cleanup after notification wakes the waiter through unattended denial."""
+        from gateway.session_context import reset_session_vars
+        from tools.approval import (
+            check_all_command_guards,
+            check_execute_code_guard,
+            register_gateway_notify,
+            unregister_gateway_notify,
+        )
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_permanent_approved", set())
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        reset_session_vars()
+        run_key = f"run-wait-race-{gate}"
+        capability = self._lease(run_key)
+        notified = threading.Event()
+        result_holder = []
+
+        def notify(_data):
+            notified.set()
+
+        register_gateway_notify(run_key, notify, capability=capability)
+
+        def worker():
+            session_token, session_tokens, capability_token = self._bind_api_context(run_key, capability)
+            try:
+                result_holder.append(
+                    check_all_command_guards("rm -rf /tmp/api-wait-race", "local")
+                    if gate == "terminal"
+                    else check_execute_code_guard("import os", "local")
+                )
+            finally:
+                self._reset_api_context(session_token, session_tokens, capability_token)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        try:
+            assert notified.wait(timeout=5), "API listener did not receive the request"
+            unregister_gateway_notify(run_key, capability=capability)
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "listener cleanup did not release the API waiter"
+            assert len(result_holder) == 1
+            assert result_holder[0]["approved"] is False
+            assert "unattended" in result_holder[0]["message"].lower()
+            assert result_holder[0].get("status") != "pending_approval"
+        finally:
+            unregister_gateway_notify(run_key, capability=capability)
+            thread.join(timeout=2)
+            reset_session_vars()
+
+        with approval_module._lock:
+            assert run_key not in approval_module._gateway_queues
+            assert run_key not in approval_module._gateway_notify_cbs
+
+    def test_api_lease_rejects_stale_context_and_cross_run_replacement(self, monkeypatch):
+        """Revocation invalidates copied contexts and a lease cannot replace another run."""
+        import contextvars
+        from tools.approval import (
+            issue_api_run_approval_lease, register_gateway_notify,
+            revoke_api_run_approval_lease, unregister_gateway_notify,
+        )
+        from tools.approval_context import (
+            reset_current_api_server_run_capability, reset_current_session_key,
+            set_current_api_server_run_capability, set_current_session_key,
+        )
+
+        key_a, key_b = "run-lease-a", "run-lease-b"
+        lease_a = issue_api_run_approval_lease(key_a, owner=object())
+        lease_b = issue_api_run_approval_lease(key_b, owner=object())
+        callback_a = lambda _data: None
+        callback_b = lambda _data: None
+        assert register_gateway_notify(key_a, callback_a, capability=lease_a)
+        assert register_gateway_notify(key_b, callback_b, capability=lease_b)
+
+        session_token = set_current_session_key(key_a)
+        lease_token = set_current_api_server_run_capability(lease_a)
+        try:
+            copied = contextvars.copy_context()
+        finally:
+            reset_current_api_server_run_capability(lease_token)
+            reset_current_session_key(session_token)
+
+        assert revoke_api_run_approval_lease(lease_a)
+        stale = lambda _data: None
+        assert copied.run(register_gateway_notify, key_a, stale, capability=lease_a) is False
+        # A stale lease cannot replace the other run's callback either.
+        assert register_gateway_notify(key_b, stale, capability=lease_a) is False
+        with approval_module._lock:
+            assert key_a not in approval_module._gateway_notify_cbs
+            assert approval_module._gateway_notify_cbs.get(key_b) is callback_b
+
+        assert unregister_gateway_notify(key_b, capability=lease_b)
+
+    @pytest.mark.parametrize("entrypoint", ["mcp", "browser"])
+    @pytest.mark.parametrize("choice", ["once", "deny"])
+    def test_api_lease_routes_consent_entrypoints_to_correlated_event(
+        self, monkeypatch, entrypoint, choice
+    ):
+        """MCP and browser consent use the same exact run event, never CLI input."""
+        from gateway.session_context import reset_session_vars
+        from tools import browser_vault_tool
+        from tools.approval import (
+            register_gateway_notify, resolve_gateway_approval,
+            unregister_gateway_notify,
+        )
+        from tools.approval_prompt import request_elicitation_consent
+
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        reset_session_vars()
+        session_key = f"api-consent-{entrypoint}-{choice}"
+        lease = self._lease(session_key)
+        notified = []
+        notified_event = threading.Event()
+        result_holder = []
+        prompt_calls = []
+
+        def notify(data):
+            notified.append(dict(data))
+            notified_event.set()
+
+        assert register_gateway_notify(session_key, notify, capability=lease)
+        monkeypatch.setattr(
+            "tools.approval_prompt.prompt_dangerous_approval",
+            lambda *args, **kwargs: prompt_calls.append((args, kwargs)) or "once",
+        )
+
+        def worker():
+            session_token, session_tokens, capability_token = self._bind_api_context(session_key, lease)
+            try:
+                if entrypoint == "mcp":
+                    result_holder.append(
+                        request_elicitation_consent("approve MCP", "untrusted MCP server")
+                    )
+                else:
+                    result_holder.append(
+                        browser_vault_tool._confirm_payment_fill("Visa", "https://shop.test")
+                    )
+            finally:
+                self._reset_api_context(session_token, session_tokens, capability_token)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        try:
+            assert notified_event.wait(timeout=5), "API consent did not emit an approval event"
+            assert notified[0]["request_id"]
+            assert notified[0]["allow_session"] is False
+            assert notified[0]["allow_permanent"] is False
+            assert notified[0]["pattern_key"] == "mcp_elicitation"
+            request_id = notified[0]["request_id"]
+            assert resolve_gateway_approval(session_key, choice, request_id=request_id) == 1
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "API consent did not resolve"
+        finally:
+            resolve_gateway_approval(session_key, "deny", resolve_all=True)
+            thread.join(timeout=2)
+            unregister_gateway_notify(session_key, capability=lease)
+            reset_session_vars()
+
+        assert prompt_calls == []
+        expected = "accept" if choice == "once" else "decline"
+        assert result_holder == ([expected] if entrypoint == "mcp" else [choice == "once"])
+
+    @pytest.mark.parametrize("platform", ["api_server", "webhook", "msgraph_webhook"])
+    def test_listenerless_programmatic_consent_never_calls_cli(self, monkeypatch, platform):
+        """Unattended consent declines immediately when no exact listener exists."""
+        from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
+        from tools.approval_context import reset_current_session_key, set_current_session_key
+        from tools.approval_prompt import request_elicitation_consent
+
+        reset_session_vars()
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        prompt_calls = []
+        monkeypatch.setattr(
+            "tools.approval_prompt.prompt_dangerous_approval",
+            lambda *args, **kwargs: prompt_calls.append((args, kwargs)) or "once",
+        )
+        session_key = f"listenerless-consent-{platform}"
+        session_token = set_current_session_key(session_key)
+        session_tokens = set_session_vars(platform=platform, session_key=session_key)
+        try:
+            result = request_elicitation_consent("approve", "untrusted action")
+        finally:
+            clear_session_vars(session_tokens)
+            reset_current_session_key(session_token)
+            reset_session_vars()
+
+        assert result == "decline"
+        assert prompt_calls == []
+        with approval_module._lock:
+            assert session_key not in approval_module._gateway_queues
+            assert session_key not in approval_module._gateway_notify_cbs
+
+    def test_copied_revoked_lease_without_platform_never_calls_cli(self, monkeypatch):
+        """A copied lease remains fail-closed even after its platform binding is gone."""
+        from gateway.session_context import reset_session_vars
+        from tools.approval import register_gateway_notify, revoke_api_run_approval_lease
+        from tools.approval_context import (
+            reset_current_api_server_run_lease, reset_current_session_key,
+            set_current_api_server_run_lease, set_current_session_key,
+        )
+        from tools.approval_prompt import request_elicitation_consent
+
+        reset_session_vars()
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        prompt_calls = []
+        monkeypatch.setattr(
+            "tools.approval_prompt.prompt_dangerous_approval",
+            lambda *args, **kwargs: prompt_calls.append((args, kwargs)) or "once",
+        )
+        session_key = "stale-lease-consent"
+        lease = self._lease(session_key)
+        assert register_gateway_notify(session_key, lambda _data: None, capability=lease)
+        session_token = set_current_session_key(session_key)
+        lease_token = set_current_api_server_run_lease(lease)
+        try:
+            assert revoke_api_run_approval_lease(lease)
+            assert request_elicitation_consent("approve", "stale lease") == "decline"
+        finally:
+            reset_current_api_server_run_lease(lease_token)
+            reset_current_session_key(session_token)
+            reset_session_vars()
+        assert prompt_calls == []
+
+    @pytest.mark.parametrize("platform", ["telegram", "api_server"])
+    def test_non_owner_context_cannot_borrow_consent_listener(self, monkeypatch, platform):
+        """A colliding non-API/API context cannot consume a run-owned consent callback."""
+        from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
+        from tools.approval import register_gateway_notify, revoke_api_run_approval_lease
+        from tools.approval_context import reset_current_session_key, set_current_session_key
+        from tools.approval_prompt import request_elicitation_consent
+
+        reset_session_vars()
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        session_key = f"consent-collision-{platform}"
+        lease = self._lease(session_key)
+        callbacks = []
+        assert register_gateway_notify(session_key, lambda data: callbacks.append(data), capability=lease)
+        session_token = set_current_session_key(session_key)
+        session_tokens = set_session_vars(platform=platform, session_key=session_key)
+        try:
+            assert request_elicitation_consent("approve", "collision") == "decline"
+        finally:
+            clear_session_vars(session_tokens)
+            reset_current_session_key(session_token)
+            revoke_api_run_approval_lease(lease)
+            reset_session_vars()
+        assert callbacks == []
+
+    @pytest.mark.parametrize("gate", ["terminal", "execute_code"])
+    @pytest.mark.parametrize("choice", ["once", "deny"])
+    def test_listener_backed_gate_waits_and_resolves_exact_request(self, monkeypatch, gate, choice):
+        from gateway.session_context import reset_session_vars
+        from tools.approval import (
+            check_all_command_guards,
+            check_execute_code_guard,
+            register_gateway_notify,
+            resolve_gateway_approval,
+            unregister_gateway_notify,
+        )
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_permanent_approved", set())
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        reset_session_vars()
+        session_key = f"api-listener-{gate}-{choice}"
+        capability = self._lease(session_key)
+        notified = []
+        notified_event = threading.Event()
+        result_holder = []
+
+        def notify(data):
+            notified.append(dict(data))
+            notified_event.set()
+
+        register_gateway_notify(session_key, notify, capability=capability)
+
+        def worker():
+            session_token, session_tokens, capability_token = self._bind_api_context(session_key, capability)
+            try:
+                if gate == "terminal":
+                    result_holder.append(check_all_command_guards("rm -rf /tmp/api-run", "local"))
+                else:
+                    result_holder.append(check_execute_code_guard("import os", "local"))
+            finally:
+                self._reset_api_context(session_token, session_tokens, capability_token)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        try:
+            assert notified_event.wait(timeout=5), "listener-backed API gate did not notify"
+            with approval_module._lock:
+                entries = list(approval_module._gateway_queues.get(session_key, []))
+            assert len(entries) == 1
+            request_id = entries[0].data["request_id"]
+            assert notified[0]["request_id"] == request_id
+            assert resolve_gateway_approval(session_key, choice, request_id="wrong-request") == 0
+            assert thread.is_alive(), "wrong request_id resolved the API gate"
+            assert resolve_gateway_approval(session_key, choice, request_id=request_id) == 1
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "exact approval response did not unblock the API gate"
+            assert len(result_holder) == 1
+            if choice == "once":
+                assert result_holder[0]["approved"] is True
+            else:
+                assert result_holder[0]["approved"] is False
+                assert result_holder[0]["outcome"] == "denied"
+            with approval_module._lock:
+                assert session_key not in approval_module._gateway_queues
+        finally:
+            resolve_gateway_approval(session_key, "deny", resolve_all=True)
+            thread.join(timeout=2)
+            unregister_gateway_notify(session_key, capability=capability)
+            with approval_module._lock:
+                assert session_key not in approval_module._gateway_notify_cbs
+            reset_session_vars()
+
+    @pytest.mark.parametrize("gate", ["terminal", "execute_code"])
+    def test_missing_api_listener_fails_closed_without_waiting(self, monkeypatch, gate):
+        from gateway.session_context import reset_session_vars
+        from tools.approval import (
+            check_all_command_guards,
+            check_execute_code_guard,
+            unregister_gateway_notify,
+        )
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_permanent_approved", set())
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(approval_context, "_get_unattended_approval_mode", lambda: "deny")
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        reset_session_vars()
+        session_key = f"api-no-listener-{gate}"
+        unregister_gateway_notify(session_key)
+        session_token, session_tokens, capability_token = self._bind_api_context(session_key)
+        try:
+            started = time.monotonic()
+            result = (
+                check_all_command_guards("rm -rf /tmp/api-run", "local")
+                if gate == "terminal"
+                else check_execute_code_guard("import os", "local")
+            )
+            assert time.monotonic() - started < 2
+            assert result["approved"] is False
+            assert "unattended" in result["message"].lower()
+            with approval_module._lock:
+                assert session_key not in approval_module._gateway_queues
+                assert session_key not in approval_module._gateway_notify_cbs
+        finally:
+            self._reset_api_context(session_token, session_tokens, capability_token)
+            reset_session_vars()
+
+
+    @pytest.mark.parametrize("choice", ["once", "deny"])
+    def test_protected_file_listener_backed_gate_waits_and_resolves_exact_request(
+        self, monkeypatch, choice
+    ):
+        """Protected-file approvals use the same exact-run listener contract."""
+        from gateway.session_context import reset_session_vars
+        from tools import file_tools_write_guards as guards
+        from tools.approval import (
+            register_gateway_notify, resolve_gateway_approval, unregister_gateway_notify,
+        )
+
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        reset_session_vars()
+        session_key = f"api-protected-{choice}"
+        capability = self._lease(session_key)
+        notified = []
+        notified_event = threading.Event()
+        result_holder = []
+
+        def notify(data):
+            notified.append(dict(data))
+            notified_event.set()
+
+        register_gateway_notify(session_key, notify, capability=capability)
+
+        def worker():
+            session_token, session_tokens, capability_token = self._bind_api_context(
+                session_key, capability)
+            try:
+                result_holder.append(
+                    guards._request_protected_instruction_approval(["AGENTS.md"], session_key)
+                )
+            finally:
+                self._reset_api_context(session_token, session_tokens, capability_token)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        try:
+            assert notified_event.wait(timeout=5), "protected-file API approval did not notify"
+            assert notified[0]["allow_permanent"] is False
+            assert notified[0]["allow_session"] is False
+            with approval_module._lock:
+                entries = list(approval_module._gateway_queues.get(session_key, []))
+            assert len(entries) == 1
+            request_id = entries[0].data["request_id"]
+            assert notified[0]["request_id"] == request_id
+            assert resolve_gateway_approval(session_key, choice, request_id="wrong-request") == 0
+            assert thread.is_alive(), "wrong request_id resolved the protected-file approval"
+            assert resolve_gateway_approval(session_key, choice, request_id=request_id) == 1
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "exact protected-file approval did not unblock the gate"
+            assert len(result_holder) == 1
+            if choice == "once":
+                assert result_holder[0] is None
+            else:
+                assert "was denied by the user" in result_holder[0]
+            with approval_module._lock:
+                assert session_key not in approval_module._gateway_queues
+                assert session_key not in approval_module._session_approved
+                assert "protected_instruction_file" not in approval_module._permanent_approved
+        finally:
+            resolve_gateway_approval(session_key, "deny", resolve_all=True)
+            thread.join(timeout=2)
+            unregister_gateway_notify(session_key, capability=capability)
+            reset_session_vars()
+
+    def test_protected_file_cleanup_between_lookup_and_dispatch_fails_closed(self, monkeypatch):
+        """Teardown after listener lookup cannot dispatch the stale callback."""
+        from gateway.session_context import reset_session_vars
+        from tools import file_tools_write_guards as guards
+        from tools.approval import register_gateway_notify, unregister_gateway_notify
+
+        reset_session_vars()
+        session_key = "api-protected-cleanup-between-lookup-dispatch"
+        capability = self._lease(session_key)
+        callback_calls = []
+        notify = lambda data: callback_calls.append(data)
+        register_gateway_notify(session_key, notify, capability=capability)
+        session_token, session_tokens, capability_token = self._bind_api_context(
+            session_key, capability)
+        original_listener = approval_module.get_current_gateway_approval_listener
+
+        def lookup_then_cleanup():
+            listener = original_listener()
+            unregister_gateway_notify(session_key, capability=capability)
+            return listener
+
+        monkeypatch.setattr(
+            approval_module, "get_current_gateway_approval_listener", lookup_then_cleanup)
+        try:
+            result = guards._request_protected_instruction_approval(["AGENTS.md"], session_key)
+        finally:
+            self._reset_api_context(session_token, session_tokens, capability_token)
+            unregister_gateway_notify(session_key, capability=capability)
+            reset_session_vars()
+
+        assert callback_calls == []
+        assert "could not be delivered" in result
+        with approval_module._lock:
+            assert session_key not in approval_module._gateway_queues
+            assert session_key not in approval_module._gateway_notify_cbs
+
+    def test_protected_file_listener_replacement_cancels_old_waiter(self, monkeypatch):
+        """A revoked lease cannot be replaced until the old listener is gone."""
+        from gateway.session_context import reset_session_vars
+        from tools import file_tools_write_guards as guards
+        from tools.approval import (
+            issue_api_run_approval_lease, register_gateway_notify,
+            revoke_api_run_approval_lease, unregister_gateway_notify,
+        )
+
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        reset_session_vars()
+        session_key = "api-protected-replacement"
+        old_capability = issue_api_run_approval_lease(session_key, owner=object())
+        notified = threading.Event()
+        result_holder = []
+
+        def old_notify(_data):
+            notified.set()
+
+        assert register_gateway_notify(session_key, old_notify, capability=old_capability)
+
+        def worker():
+            session_token, session_tokens, capability_token = self._bind_api_context(
+                session_key, old_capability)
+            try:
+                result_holder.append(
+                    guards._request_protected_instruction_approval(["AGENTS.md"], session_key)
+                )
+            finally:
+                self._reset_api_context(session_token, session_tokens, capability_token)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        new_capability = None
+        try:
+            assert notified.wait(timeout=5), "old protected-file listener did not notify"
+            assert revoke_api_run_approval_lease(old_capability)
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "lease revocation did not release protected waiter"
+            assert len(result_holder) == 1
+            assert "could not be delivered" in result_holder[0]
+            with approval_module._lock:
+                assert session_key not in approval_module._gateway_notify_cbs
+                assert session_key not in approval_module._gateway_notify_capabilities
+
+            new_capability = issue_api_run_approval_lease(session_key, owner=object())
+            replacement = lambda _data: None
+            assert register_gateway_notify(session_key, replacement, capability=new_capability)
+            # The stale lease cannot remove or replace the new run.
+            assert unregister_gateway_notify(session_key, capability=old_capability) is False
+            with approval_module._lock:
+                assert approval_module._gateway_notify_cbs.get(session_key) is replacement
+                assert approval_module._gateway_notify_capabilities.get(session_key) is new_capability
+        finally:
+            thread.join(timeout=2)
+            if new_capability is not None:
+                unregister_gateway_notify(session_key, capability=new_capability)
+            else:
+                revoke_api_run_approval_lease(old_capability)
+            reset_session_vars()
+
+    @pytest.mark.parametrize("platform", ["api_server", "webhook", "msgraph_webhook"])
+    def test_protected_file_listenerless_programmatic_platform_fails_closed(self, monkeypatch, platform):
+        """Programmatic platforms never fall through to CLI or pending approval."""
+        from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
+        from tools import file_tools_write_guards as guards
+        from tools.approval_context import reset_current_session_key, set_current_session_key
+
+        reset_session_vars()
+        monkeypatch.setattr("tools.terminal_tool._get_approval_callback", lambda: object())
+        prompt_calls = []
+        monkeypatch.setattr(
+            "tools.approval_prompt.prompt_dangerous_approval",
+            lambda *args, **kwargs: prompt_calls.append((args, kwargs)) or "once",
+        )
+        session_key = f"listenerless-protected-{platform}"
+        session_token = set_current_session_key(session_key)
+        session_tokens = set_session_vars(platform=platform, session_key=session_key)
+        try:
+            result = guards._request_protected_instruction_approval(["AGENTS.md"], session_key)
+        finally:
+            clear_session_vars(session_tokens)
+            reset_current_session_key(session_token)
+            reset_session_vars()
+
+        assert result is not None
+        assert "user has NOT consented" in result
+        assert prompt_calls == []
+        with approval_module._lock:
+            assert session_key not in approval_module._gateway_queues
+            assert session_key not in approval_module._pending
+            assert session_key not in approval_module._gateway_notify_cbs
+
+    def test_protected_file_non_api_gateway_round_trip_is_preserved(self, monkeypatch):
+        """A non-api gateway still gets one-operation protected-file approval."""
+        from gateway.session_context import reset_session_vars
+        from tools import file_tools_write_guards as guards
+        from tools.approval import register_gateway_notify, resolve_gateway_approval, unregister_gateway_notify
+
+        reset_session_vars()
+        session_key = "telegram-protected-round-trip"
+        notified = threading.Event()
+        result_holder = []
+
+        def notify(_data):
+            notified.set()
+
+        register_gateway_notify(session_key, notify)
+
+        def worker():
+            session_token, session_tokens, capability_token = self._bind_api_context(
+                session_key, None)
+            try:
+                # Replace the API platform set by the shared helper with a normal gateway platform.
+                from gateway.session_context import clear_session_vars, set_session_vars
+                clear_session_vars(session_tokens)
+                session_tokens = set_session_vars(platform="telegram", session_key=session_key)
+                result_holder.append(
+                    guards._request_protected_instruction_approval(["AGENTS.md"], session_key)
+                )
+            finally:
+                self._reset_api_context(session_token, session_tokens, capability_token)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        try:
+            assert notified.wait(timeout=5), "non-api protected-file listener did not notify"
+            assert resolve_gateway_approval(session_key, "once") == 1
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+            assert result_holder == [None]
+        finally:
+            resolve_gateway_approval(session_key, "deny", resolve_all=True)
+            thread.join(timeout=2)
+            unregister_gateway_notify(session_key)
+            reset_session_vars()
+
+
+class TestApiRunLeaseFinalRework:
+    """F8-F10 regressions: lease ownership, one-shot transports, and dispatch races."""
+
+    @staticmethod
+    def _api_data(command: str, key: str) -> dict:
+        return {
+            "command": command,
+            "description": "API-run approval",
+            "pattern_key": key,
+            "pattern_keys": [key],
+        }
+
+    @pytest.mark.parametrize("gate", ["terminal", "execute_code"])
+    def test_revoked_bound_lease_fails_before_unattended_approve(self, monkeypatch, gate):
+        """A copied revoked lease cannot inherit unattended_mode: approve."""
+        from gateway.session_context import reset_session_vars
+        from tools.approval import (
+            check_all_command_guards,
+            check_execute_code_guard,
+            register_gateway_notify,
+            revoke_api_run_approval_lease,
+        )
+        from tools.approval_context import (
+            reset_current_api_server_run_lease,
+            reset_current_session_key,
+            set_current_api_server_run_lease,
+            set_current_session_key,
+        )
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(approval_context, "_get_unattended_approval_mode", lambda: "approve")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        reset_session_vars()
+        session_key = f"f8-revoked-{gate}"
+        lease = approval_module.issue_api_run_approval_lease(session_key, owner=object())
+        assert lease is not None
+        callback_calls = []
+        assert register_gateway_notify(
+            session_key, lambda data: callback_calls.append(data), capability=lease
+        )
+        session_token = set_current_session_key(session_key)
+        lease_token = set_current_api_server_run_lease(lease)
+        try:
+            assert revoke_api_run_approval_lease(lease)
+            # Model a copied worker context after its platform/session routing
+            # metadata has been cleared: the lease is the only remaining marker.
+            result = (
+                check_all_command_guards("rm -rf /tmp/f8-revoked", "local")
+                if gate == "terminal"
+                else check_execute_code_guard("import os", "local")
+            )
+        finally:
+            reset_current_api_server_run_lease(lease_token)
+            reset_current_session_key(session_token)
+            reset_session_vars()
+
+        assert result["approved"] is False
+        assert "unattended" in result["message"].lower()
+        assert callback_calls == []
+        with approval_module._lock:
+            assert session_key not in approval_module._gateway_queues
+            assert session_key not in approval_module._api_run_approval_leases
+
+    def test_valid_copied_lease_forces_once_before_plugin_transport(self, monkeypatch):
+        """A valid lease bypasses ordinary plugin transports and uses its API listener."""
+        from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
+        from tools.approval import (
+            check_all_command_guards,
+            register_gateway_notify,
+            resolve_gateway_approval,
+            unregister_gateway_notify,
+        )
+        from tools.approval_context import (
+            reset_current_api_server_run_lease,
+            reset_current_session_key,
+            set_current_api_server_run_lease,
+            set_current_session_key,
+        )
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        reset_session_vars()
+        session_key = "f9-copied-lease"
+        lease = approval_module.issue_api_run_approval_lease(session_key, owner=object())
+        assert lease is not None
+        callback_calls = []
+
+        def notify(data):
+            callback_calls.append(dict(data))
+            assert data["allow_session"] is False
+            assert data["allow_permanent"] is False
+            assert resolve_gateway_approval(
+                session_key, "once", request_id=data["request_id"]
+            ) == 1
+
+        assert register_gateway_notify(session_key, notify, capability=lease)
+        transport_calls = []
+
+        def selected_transport(**kwargs):
+            transport_calls.append(kwargs)
+            return {"selected": True, "choice": "always", "failure": None,
+                    "fallback": None, "name": "test-transport"}
+
+        monkeypatch.setattr(approval_module, "_present_with_selected_transport", selected_transport)
+        session_token = set_current_session_key(session_key)
+        lease_token = set_current_api_server_run_lease(lease)
+        platform_tokens = set_session_vars(platform="telegram", session_key=session_key)
+        try:
+            results = [
+                check_all_command_guards("rm -rf /tmp/f9-once", "local"),
+                check_all_command_guards("rm -rf /tmp/f9-once", "local"),
+            ]
+        finally:
+            clear_session_vars(platform_tokens)
+            reset_current_api_server_run_lease(lease_token)
+            reset_current_session_key(session_token)
+            unregister_gateway_notify(session_key, capability=lease)
+            reset_session_vars()
+
+        assert all(result["approved"] is True for result in results)
+        assert transport_calls == [], "API-run approval must not use the ordinary plugin transport"
+        assert len(callback_calls) == 2, "each API-run operation must emit one listener event"
+        with approval_module._lock:
+            assert session_key not in approval_module._session_approved
+            assert session_key not in approval_module._gateway_queues
+
+    def test_valid_lease_never_falls_to_cli_prompt(self, monkeypatch):
+        """A copied lease still uses its listener when the caller looks CLI-shaped."""
+        from tools.approval import (
+            _COMMAND_GATE,
+            _human_decision,
+            issue_api_run_approval_lease,
+            register_gateway_notify,
+            resolve_gateway_approval,
+            unregister_gateway_notify,
+        )
+        from tools.approval_context import (
+            reset_current_api_server_run_lease,
+            reset_current_session_key,
+            set_current_api_server_run_lease,
+            set_current_session_key,
+        )
+
+        session_key = "f9-cli-scopes"
+        lease = issue_api_run_approval_lease(session_key, owner=object())
+        assert lease is not None
+        callback_calls = []
+
+        def notify(data):
+            callback_calls.append(dict(data))
+            assert data["allow_session"] is False
+            assert data["allow_permanent"] is False
+            assert resolve_gateway_approval(
+                session_key, "once", request_id=data["request_id"]
+            ) == 1
+
+        assert register_gateway_notify(session_key, notify, capability=lease)
+        monkeypatch.setattr(
+            approval_module, "_present_with_selected_transport",
+            lambda **_kwargs: pytest.fail("API lease must not use plugin transport"),
+        )
+        monkeypatch.setattr(
+            approval_module, "prompt_dangerous_approval",
+            lambda *_args, **_kwargs: pytest.fail("API lease must not use CLI prompt"),
+        )
+        session_token = set_current_session_key(session_key)
+        lease_token = set_current_api_server_run_lease(lease)
+        try:
+            result = _human_decision(
+                _COMMAND_GATE,
+                command="rm -rf /tmp/f9-cli",
+                description="dangerous command",
+                pattern_key="dangerous_command",
+                pattern_keys=["dangerous_command"],
+                warnings=[("dangerous_command", None, False)],
+                session_key=session_key,
+                approval_callback=None,
+                is_cli=True,
+                is_gateway=True,
+                is_ask=False,
+            )
+        finally:
+            reset_current_api_server_run_lease(lease_token)
+            reset_current_session_key(session_token)
+            unregister_gateway_notify(session_key, capability=lease)
+
+        assert result["approved"] is True
+        assert len(callback_calls) == 1
+        with approval_module._lock:
+            assert session_key not in approval_module._session_approved
+
+    @pytest.mark.parametrize(
+        ("mode", "env_type"),
+        [
+            ("process_yolo", "local"),
+            ("session_yolo", "local"),
+            ("off", "local"),
+            ("plugin", "local"),
+            ("docker", "docker"),
+            ("vercel", "vercel_sandbox"),
+        ],
+    )
+    def test_f9_fresh_interpreter_lease_floor_matrix(self, mode, env_type):
+        """Import-time and runtime bypasses still require one API event per route."""
+        child = r'''
+import json
+from gateway.session_context import clear_session_vars, set_session_vars
+from tools import approval, approval_context
+from tools.approval_context import (
+    reset_current_api_server_run_lease,
+    reset_current_session_key,
+    set_current_api_server_run_lease,
+    set_current_session_key,
+)
+
+session_key = "f9-fresh-" + "__MODE__"
+lease = approval.issue_api_run_approval_lease(session_key, owner=object())
+assert lease is not None
+callbacks = []
+plugin_calls = []
+
+def notify(data):
+    callbacks.append(dict(data))
+    assert data["allow_session"] is False
+    assert data["allow_permanent"] is False
+    assert approval.resolve_gateway_approval(
+        session_key, "once", request_id=data["request_id"]
+    ) == 1
+
+def selected_transport(**kwargs):
+    plugin_calls.append(kwargs)
+    return {"selected": True, "choice": "always", "failure": None,
+            "fallback": None, "name": "stale-plugin"}
+
+approval._present_with_selected_transport = selected_transport
+assert approval.register_gateway_notify(session_key, notify, capability=lease)
+session_token = set_current_session_key(session_key)
+lease_token = set_current_api_server_run_lease(lease)
+session_tokens = set_session_vars(platform="api_server", session_key=session_key)
+try:
+    if "__MODE__" == "session_yolo":
+        approval.enable_session_yolo(session_key)
+    elif "__MODE__" == "off":
+        approval_context._get_approval_mode = lambda: "off"
+    results = [
+        approval.check_dangerous_command("rm -rf /tmp/f9-fresh", "__ENV__"),
+        approval.check_all_command_guards("rm -rf /tmp/f9-fresh", "__ENV__"),
+        approval.check_execute_code_guard("import os", "__ENV__"),
+        approval.request_tool_approval("plugin_tool", "plugin flagged action", rule_key="f9-plugin"),
+    ]
+    bypass_active = approval.is_approval_bypass_active()
+finally:
+    clear_session_vars(session_tokens)
+    reset_current_api_server_run_lease(lease_token)
+    reset_current_session_key(session_token)
+    approval.unregister_gateway_notify(session_key, capability=lease)
+
+with approval._lock:
+    persisted_session = sorted(approval._session_approved.get(session_key, set()))
+    persisted_permanent = sorted(approval._permanent_approved)
+    queued = bool(approval._gateway_queues.get(session_key))
+print(json.dumps({
+    "approved": [result.get("approved") for result in results],
+    "outcomes": [result.get("outcome") for result in results],
+    "callback_count": len(callbacks),
+    "callback_scopes": [(item["allow_session"], item["allow_permanent"]) for item in callbacks],
+    "plugin_calls": len(plugin_calls),
+    "bypass_active": bypass_active,
+    "persisted_session": persisted_session,
+    "persisted_permanent": persisted_permanent,
+    "queued": queued,
+}))
+'''.replace("__MODE__", mode).replace("__ENV__", env_type)
+        env = os.environ.copy()
+        if mode == "process_yolo":
+            env["HERMES_YOLO_MODE"] = "1"
+        else:
+            env.pop("HERMES_YOLO_MODE", None)
+        completed = subprocess.run(
+            [sys.executable, "-c", child],
+            cwd=str(Path(__file__).resolve().parents[2]),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr or completed.stdout
+        payload = json.loads(completed.stdout.strip().splitlines()[-1])
+        assert payload["approved"] == [True, True, True, True]
+        assert payload["outcomes"] == [None, None, None, None]
+        assert payload["callback_count"] == 4
+        assert payload["callback_scopes"] == [[False, False]] * 4
+        assert payload["plugin_calls"] == 0
+        assert payload["bypass_active"] is False
+        assert payload["persisted_session"] == []
+        assert payload["persisted_permanent"] == []
+        assert payload["queued"] is False
+
+    def test_ordinary_non_api_shortcuts_remain(self, monkeypatch):
+        """YOLO, off, and isolated-backend shortcuts remain non-API behavior."""
+        from tools.approval import (
+            check_all_command_guards,
+            check_execute_code_guard,
+            request_tool_approval,
+        )
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "off")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        results = [
+            check_all_command_guards("rm -rf /tmp/non-api", "local"),
+            check_execute_code_guard("import os", "local"),
+            check_all_command_guards("rm -rf /tmp/non-api", "docker"),
+            check_execute_code_guard("import os", "vercel_sandbox"),
+            request_tool_approval("plugin_tool", "ordinary trusted action", rule_key="non-api"),
+        ]
+        assert all(result["approved"] is True for result in results)
+
+    def test_callback_can_resolve_synchronously_without_deadlock(self):
+        """A notifier may call /approval resolution re-entrantly."""
+        from tools.approval import (
+            _await_gateway_decision,
+            issue_api_run_approval_lease,
+            register_gateway_notify,
+            resolve_gateway_approval,
+            unregister_gateway_notify,
+        )
+
+        session_key = "f10-sync-resolve"
+        lease = issue_api_run_approval_lease(session_key, owner=object())
+        assert lease is not None
+
+        def notify(data):
+            assert resolve_gateway_approval(
+                session_key, "once", request_id=data["request_id"]
+            ) == 1
+
+        assert register_gateway_notify(session_key, notify, capability=lease)
+        try:
+            result = _await_gateway_decision(
+                session_key, notify, self._api_data("rm -rf /tmp/f10", "f10-sync"),
+                api_server_capability=lease, require_api_server_capability=True,
+            )
+        finally:
+            unregister_gateway_notify(session_key, capability=lease)
+        assert result["resolved"] is True
+        assert result["choice"] == "once"
+
+    def test_callback_can_unregister_synchronously_and_fails_closed(self):
+        """A notifier may tear down its own listener without deadlocking."""
+        from tools.approval import (
+            _await_gateway_decision,
+            issue_api_run_approval_lease,
+            register_gateway_notify,
+            unregister_gateway_notify,
+        )
+
+        session_key = "f10-sync-unregister"
+        lease = issue_api_run_approval_lease(session_key, owner=object())
+        assert lease is not None
+
+        def notify(_data):
+            assert unregister_gateway_notify(session_key, capability=lease)
+
+        assert register_gateway_notify(session_key, notify, capability=lease)
+        result = _await_gateway_decision(
+            session_key, notify, self._api_data("rm -rf /tmp/f10-unregister", "f10-unregister"),
+            api_server_capability=lease, require_api_server_capability=True,
+        )
+        assert result == {"resolved": False, "choice": None, "notify_failed": True}
+
+    def test_slow_callback_does_not_block_revoke_and_replacement_is_atomic(self):
+        """Slow dispatch releases the lock; revoke/replacement invalidates the old result."""
+        from tools.approval import (
+            _await_gateway_decision,
+            issue_api_run_approval_lease,
+            register_gateway_notify,
+            unregister_gateway_notify,
+        )
+
+        session_key = "f10-slow-replace"
+        old_lease = issue_api_run_approval_lease(session_key, owner=object())
+        assert old_lease is not None
+        callback_started = threading.Event()
+        callback_release = threading.Event()
+        waiter_result = []
+
+        def slow_notify(_data):
+            callback_started.set()
+            assert callback_release.wait(timeout=5)
+
+        assert register_gateway_notify(session_key, slow_notify, capability=old_lease)
+
+        waiter = threading.Thread(
+            target=lambda: waiter_result.append(
+                _await_gateway_decision(
+                    session_key, slow_notify, self._api_data("rm -rf /tmp/f10-slow", "f10-slow"),
+                    api_server_capability=old_lease, require_api_server_capability=True,
+                )
+            )
+        )
+        waiter.start()
+        assert callback_started.wait(timeout=5)
+
+        # This must complete while slow_notify is still blocked. Under the old
+        # implementation it deadlocked on the global approval lock.
+        cleanup_done = threading.Event()
+
+        def cleanup():
+            assert unregister_gateway_notify(session_key, capability=old_lease)
+            cleanup_done.set()
+
+        cleanup_thread = threading.Thread(target=cleanup)
+        cleanup_thread.start()
+        assert cleanup_done.wait(timeout=2), "cleanup blocked behind a slow notifier"
+        cleanup_thread.join(timeout=2)
+
+        new_lease = issue_api_run_approval_lease(session_key, owner=object())
+        assert new_lease is not None
+        replacement = lambda _data: None
+        assert register_gateway_notify(session_key, replacement, capability=new_lease)
+        callback_release.set()
+        waiter.join(timeout=5)
+        try:
+            assert not waiter.is_alive()
+            assert waiter_result == [{"resolved": False, "choice": None, "notify_failed": True}]
+            with approval_module._lock:
+                assert approval_module._gateway_notify_cbs.get(session_key) is replacement
+                assert approval_module._gateway_notify_capabilities.get(session_key) is new_lease
+        finally:
+            unregister_gateway_notify(session_key, capability=new_lease)
+
+    def test_notify_exception_fails_closed_and_cleans_entry(self):
+        from tools.approval import (
+            _await_gateway_decision,
+            issue_api_run_approval_lease,
+            register_gateway_notify,
+            unregister_gateway_notify,
+        )
+
+        session_key = "f10-notify-exception"
+        lease = issue_api_run_approval_lease(session_key, owner=object())
+        assert lease is not None
+
+        def notify(_data):
+            raise RuntimeError("simulated gateway failure")
+
+        assert register_gateway_notify(session_key, notify, capability=lease)
+        try:
+            result = _await_gateway_decision(
+                session_key, notify, self._api_data("rm -rf /tmp/f10-error", "f10-error"),
+                api_server_capability=lease, require_api_server_capability=True,
+            )
+        finally:
+            unregister_gateway_notify(session_key, capability=lease)
+        assert result == {"resolved": False, "choice": None, "notify_failed": True}
+        with approval_module._lock:
+            assert session_key not in approval_module._gateway_queues
+
+    def test_callback_exception_wakes_coalesced_followers(self):
+        """A failed leader notify cannot strand followers on its event."""
+        from tools.approval import (
+            _await_gateway_decision,
+            issue_api_run_approval_lease,
+            register_gateway_notify,
+            unregister_gateway_notify,
+        )
+
+        session_key = "f10-notify-exception-followers"
+        lease = issue_api_run_approval_lease(session_key, owner=object())
+        assert lease is not None
+        callback_started = threading.Event()
+        callback_release = threading.Event()
+        callback_count = 0
+        callback_lock = threading.Lock()
+        results = []
+        payload = self._api_data("rm -rf /tmp/f10-followers", "f10-followers")
+
+        def notify(_data):
+            nonlocal callback_count
+            with callback_lock:
+                callback_count += 1
+            callback_started.set()
+            assert callback_release.wait(timeout=5)
+            raise RuntimeError("simulated gateway failure")
+
+        assert register_gateway_notify(session_key, notify, capability=lease)
+
+        def wait_one():
+            results.append(_await_gateway_decision(
+                session_key, notify, payload,
+                api_server_capability=lease, require_api_server_capability=True,
+            ))
+
+        leader = threading.Thread(target=wait_one)
+        follower = threading.Thread(target=wait_one)
+        leader.start()
+        assert callback_started.wait(timeout=5)
+        follower.start()
+        # Let the follower attach to the leader's queued entry before the
+        # external callback is released to fail.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with approval_module._lock:
+                if len(approval_module._gateway_queues.get(session_key, [])) == 1:
+                    break
+            time.sleep(0.01)
+        callback_release.set()
+        leader.join(timeout=5)
+        follower.join(timeout=5)
+        try:
+            assert not leader.is_alive() and not follower.is_alive()
+            assert callback_count == 1
+            assert len(results) == 2
+            assert all(
+                result.get("notify_failed")
+                and result.get("resolved") is False
+                and result.get("choice") is None
+                for result in results
+            )
+            assert sum(1 for result in results if result.get("coalesced")) == 1
+            with approval_module._lock:
+                assert session_key not in approval_module._gateway_queues
+        finally:
+            unregister_gateway_notify(session_key, capability=lease)
+
+    def test_dispatch_stress_128_distinct_requests(self):
+        """Concurrent callback dispatch remains leak-free at the review stress size."""
+        from concurrent.futures import ThreadPoolExecutor
+        from tools.approval import (
+            _await_gateway_decision,
+            issue_api_run_approval_lease,
+            register_gateway_notify,
+            resolve_gateway_approval,
+            unregister_gateway_notify,
+        )
+
+        session_key = "f10-stress-128"
+        lease = issue_api_run_approval_lease(session_key, owner=object())
+        assert lease is not None
+        callback_count = 0
+        callback_lock = threading.Lock()
+
+        def notify(data):
+            nonlocal callback_count
+            with callback_lock:
+                callback_count += 1
+            assert resolve_gateway_approval(
+                session_key, "once", request_id=data["request_id"]
+            ) == 1
+
+        assert register_gateway_notify(session_key, notify, capability=lease)
+
+        def wait_one(index):
+            return _await_gateway_decision(
+                session_key, notify,
+                self._api_data(f"rm -rf /tmp/f10-{index}", f"f10-{index}"),
+                api_server_capability=lease, require_api_server_capability=True,
+            )
+
+        try:
+            with ThreadPoolExecutor(max_workers=32) as pool:
+                results = list(pool.map(wait_one, range(128)))
+        finally:
+            unregister_gateway_notify(session_key, capability=lease)
+
+        assert callback_count == 128
+        assert all(result["resolved"] and result["choice"] == "once" for result in results)
+        with approval_module._lock:
+            assert session_key not in approval_module._gateway_queues
+            assert session_key not in approval_module._gateway_notify_cbs
+            assert session_key not in approval_module._api_run_approval_leases
 
 
 class TestNormalizationBypass:

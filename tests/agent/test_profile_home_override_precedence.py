@@ -152,6 +152,57 @@ def test_full_prompt_scoped_to_bot_on_bare_thread(tmp_path, monkeypatch):
     assert "Active Hermes profile: default" not in prompt
 
 
+def test_explicit_pin_beats_wrong_bound_override(tmp_path, monkeypatch):
+    """API-server lane (#50233 class): an agent pinned to its own profile home
+    at creation must keep resolving that home even when the rebuilding
+    thread's ContextVar is bound to a DIFFERENT profile of the multiplexer
+    (inherited context on a shared worker), which previously swapped in the
+    launch profile's SOUL."""
+    from agent import system_prompt
+
+    root = tmp_path / "root"
+    root.mkdir()
+    phone_home = root / "profiles" / "clyde-phone"
+    phone_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    agent = _agent_for(phone_home, _hermes_profile_home_pin=str(phone_home))
+    # Rebuild context wrongly bound to the ROOT profile's home.
+    token = set_hermes_home_override(str(root))
+    try:
+        assert system_prompt._agent_home(agent) == phone_home
+        assert (
+            system_prompt._profile_name_for_home(system_prompt._agent_home(agent))
+            == "clyde-phone"
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_explicit_pin_resolves_on_bare_thread(tmp_path, monkeypatch):
+    """The pin also carries across bare threads (no ContextVar at all)."""
+    from agent import system_prompt
+
+    root = tmp_path / "root"
+    phone_home = root / "profiles" / "clyde-phone"
+    phone_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    # Deliberately hand the agent the ROOT db: the pin must win over the
+    # db-derived fallback too.
+    agent = _agent_for(root, _hermes_profile_home_pin=str(phone_home))
+    result = {}
+
+    def resolve():
+        result["home"] = system_prompt._agent_home(agent)
+
+    t = threading.Thread(target=resolve)
+    t.start()
+    t.join()
+
+    assert result["home"] == phone_home
+
+
 def test_plugin_session_info_profile_from_agent_home(tmp_path, monkeypatch):
     """Plugin prompt metadata must carry the agent's own profile name, not the
     ambient one (@helix4u's plugin half)."""

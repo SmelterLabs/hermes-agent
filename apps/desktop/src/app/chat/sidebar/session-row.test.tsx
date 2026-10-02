@@ -56,7 +56,11 @@ vi.mock('@/i18n', () => ({
   })
 }))
 
-vi.mock('@/app/chat/profile-tag', () => ({ ProfileTag: () => null }))
+vi.mock('@/app/chat/profile-tag', () => ({
+  ProfileTag: ({ profile }: { profile: null | string | undefined }) => (
+    <span data-testid="profile-tag">{profile || 'default'}</span>
+  )
+}))
 vi.mock('@/app/chat/session-drag', () => ({ startSessionDrag: vi.fn() }))
 // PlatformAvatar is intentionally NOT mocked (do not reintroduce this — see
 // #67500, Gille's third pass): it's a forwardRef component that spreads its
@@ -207,6 +211,13 @@ describe('SidebarSessionRow', () => {
   afterEach(() => {
     vi.useRealTimers()
   })
+
+  it('shows the owner badge for a default-profile session in every sidebar view', () => {
+    renderRow(makeSession({ title: 'Owned by Clyde' }))
+
+    expect(screen.getByTestId('profile-tag').textContent).toBe('default')
+  })
+
 
   // Full-title tooltip on hover (#83000-class ask): the label is a tooltip
   // trigger, but the tip only opens when the title is actually truncated.

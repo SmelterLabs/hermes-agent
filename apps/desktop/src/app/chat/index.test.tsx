@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { useState } from 'react'
 import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -26,10 +26,10 @@ vi.mock('@/components/assistant-ui/thread', async () => {
   const React = await import('react')
 
   return {
-    Thread: () => {
+    Thread: ({ sessionKey }: { sessionKey: string }) => {
       threadRenderCount.current += 1
 
-      return React.createElement('div', { 'data-testid': 'thread' })
+      return React.createElement('div', { 'data-testid': 'thread', 'data-session-key': sessionKey })
     }
   }
 })
@@ -106,7 +106,7 @@ describe('ChatView render isolation', () => {
     $sessions.set([])
   })
 
-  it('does not re-render chat history when an unrelated parent idle tick updates', () => {
+  it('preserves transcript identity on idle ticks and compression, but not a different conversation', () => {
     const props = {
       gateway: null,
       maxVoiceRecordingSeconds: 120,
@@ -161,5 +161,24 @@ describe('ChatView render isolation', () => {
     // memo(ChatView) with stable props must absorb the parent's idle tick —
     // the transcript (Thread) must not re-render. This is PR #38470's contract.
     expect(threadRenderCount.current).toBe(1)
+    expect(screen.getByTestId('thread').getAttribute('data-session-key')).toBe('stored-1')
+
+    act(() => {
+      $sessions.set([
+        { id: 'stored-1-tip', _lineage_root_id: 'stored-1', message_count: 1, title: 'Stable chat' } as never
+      ])
+      $selectedStoredSessionId.set('stored-1-tip')
+    })
+
+    // Compression rotates the storage id, not the conversation. A new key
+    // resets the thread's render budget and explicitly pins it to the bottom.
+    expect(screen.getByTestId('thread').getAttribute('data-session-key')).toBe('stored-1')
+
+    act(() => {
+      $sessions.set([{ id: 'stored-2', message_count: 1, title: 'Different chat' } as never])
+      $selectedStoredSessionId.set('stored-2')
+    })
+
+    expect(screen.getByTestId('thread').getAttribute('data-session-key')).toBe('stored-2')
   })
 })

@@ -11,6 +11,9 @@ import {
 import { defaultNewSessionTarget, prepareDefaultNewSession } from '@/app/session/new-session-route'
 import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
+// From the leaf module, NOT the '@/hermes' barrel — test factories mocking
+// the barrel would each need the new export; nothing mocks the leaf.
+import { SESSION_RESUME_REQUEST_TIMEOUT_MS } from '@/api/client'
 import {
   deleteSession,
   fetchStoredTranscriptAcrossBackends,
@@ -1424,8 +1427,8 @@ export function useSessionActions({
       // its bounded retries into the "retries gave up" screen while the bot's
       // own backend is healthy one port over (#89206: local pool AND SSH).
       // requestForSessionProfile re-resolves the route at each call.
-      const requestForSession = <T>(method: string, params: Record<string, unknown> = {}): Promise<T> =>
-        requestForSessionProfile<T>(sessionOwner, requestGateway, method, params)
+      const requestForSession = <T>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> =>
+        requestForSessionProfile<T>(sessionOwner, requestGateway, method, params, timeoutMs)
 
       if (!isCurrentResume()) {
         return
@@ -2063,7 +2066,10 @@ export function useSessionActions({
           () =>
             requestForSession<SessionResumeResult>(
               'session.resume',
-              primaryResumeParams(storedSessionId, watchWindow, options?.authoritativeSnapshot, sessionProfile)
+              primaryResumeParams(storedSessionId, watchWindow, options?.authoritativeSnapshot, sessionProfile),
+              // Cold resumes can block on a server-side agent build for 30s-minutes;
+              // the generic 30s ack budget failed first opens.
+              SESSION_RESUME_REQUEST_TIMEOUT_MS
             ),
           { requiresMessages: options?.authoritativeSnapshot, scope: sessionOwner }
         ).then(resumed => {

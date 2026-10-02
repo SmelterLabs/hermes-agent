@@ -11,6 +11,7 @@ const baseProps = {
   loading: false,
   onBack: vi.fn(),
   onForward: vi.fn(),
+  onAutofill: vi.fn(),
   onNavigate: vi.fn(),
   onPopOut: vi.fn(),
   onReload: vi.fn(),
@@ -79,6 +80,42 @@ describe('normalizePreviewAddress', () => {
 })
 
 describe('PreviewBrowserBar', () => {
+  it('renders the navigation controls and the page toggles', () => {
+    const rendered = render(<PreviewBrowserBar {...baseProps} />)
+
+    expect(rendered.getByRole('button', { name: 'Back' })).toBeTruthy()
+    expect(rendered.getByRole('button', { name: 'Forward' })).toBeTruthy()
+    expect(rendered.getByRole('button', { name: 'Reload page' })).toBeTruthy()
+    expect(rendered.getByRole('button', { name: 'Fill from Bitwarden' })).toBeTruthy()
+    expect(rendered.getByRole('button', { name: 'Copy URL' })).toBeTruthy()
+    expect(rendered.getByRole('button', { name: 'Pop out' })).toBeTruthy()
+    expect(rendered.getByRole('button', { name: 'Show preview console' })).toBeTruthy()
+    expect(rendered.getByRole('button', { name: 'Open preview DevTools' })).toBeTruthy()
+    expect(address(rendered)).toBeTruthy()
+  })
+
+  it('renders the Annotate control and a blue Commenting status while the mode is on', () => {
+    const onToggleAnnotate = vi.fn()
+    const rendered = render(<PreviewBrowserBar {...baseProps} annotateMode onToggleAnnotate={onToggleAnnotate} />)
+
+    const toggle = rendered.getByRole('button', { name: 'Stop annotating' })
+    expect(toggle.getAttribute('aria-pressed')).toBe('true')
+    fireEvent.click(toggle)
+    expect(onToggleAnnotate).toHaveBeenCalledOnce()
+    expect(rendered.getByText('Commenting').getAttribute('data-annotate-status')).toBe('commenting')
+  })
+
+  it('flushes stacked comments from the bar without implying a send on save', () => {
+    const onFlushComments = vi.fn()
+
+    const rendered = render(
+      <PreviewBrowserBar {...baseProps} commentCount={2} onFlushComments={onFlushComments} onToggleAnnotate={vi.fn()} />
+    )
+
+    fireEvent.click(rendered.getByRole('button', { name: 'Add 2 comments' }))
+    expect(onFlushComments).toHaveBeenCalledOnce()
+  })
+
   it('disables back and forward when there is no history', () => {
     const rendered = render(<PreviewBrowserBar {...baseProps} />)
 
@@ -90,6 +127,7 @@ describe('PreviewBrowserBar', () => {
     ['Back', 'onBack'],
     ['Forward', 'onForward'],
     ['Reload page', 'onReload'],
+    ['Fill from Bitwarden', 'onAutofill'],
     ['Pop out', 'onPopOut']
   ] as const)('fires %s', (label, handler) => {
     const spy = vi.fn()

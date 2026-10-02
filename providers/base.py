@@ -118,6 +118,10 @@ class ProviderProfile:
     process_args: tuple = ()             # default argv tail, e.g. ("--acp", "--stdio")
     process_command_env_vars: tuple = ()  # env overrides for the binary, in priority order
     process_args_env_var: str = ""       # env override for argv (shlex-split)
+    # True only when this external-process client returns an iterable chunk stream for
+    # ``stream=True`` (OpenAI ``chat.completion.chunk`` objects). ACP/stdio agents return one
+    # completed object and must stay False; the Claude direct-SDK plugin streams and opts in.
+    streams_completions: bool = False
 
     # ── Model catalog ─────────────────────────────────────────
     # fallback_models: curated list shown in /model picker when live fetch fails.

@@ -70,6 +70,23 @@ describe('ProjectOverviewRow', () => {
     projectsStore.projectProfile.mockReset().mockReturnValue('default')
   })
 
+
+  it('passes the project default profile when starting a session', () => {
+    const ownedProject = {
+      ...project,
+      defaultProfile: 'picasso',
+      path: 'C:/work/content-studio'
+    } as SidebarProjectTree
+
+    const onNewSession = vi.fn()
+
+    render(<ProjectOverviewRow onNewSession={onNewSession} project={ownedProject} />)
+    fireEvent.click(screen.getByRole('button', { name: 'New session in Test D' }))
+
+    expect(onNewSession).toHaveBeenCalledWith('C:/work/content-studio', 'picasso')
+  })
+
+
   it('does not render the disclosure toggle when there is nothing to preview', () => {
     render(<ProjectOverviewRow project={project} />)
 

@@ -1,7 +1,11 @@
 """Tests for ``hermes peer`` — cross-machine bot-to-bot DMs."""
 
+import io
 import json
+import os
 import threading
+import time
+import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 
@@ -193,6 +197,48 @@ def fake_peer_server():
     finally:
         server.shutdown()
         thread.join(timeout=5)
+
+
+def test_named_profile_dm_uses_profile_bot_chat_without_direct_probe(monkeypatch, capsys):
+    paths = []
+
+    class ProfilePeer(_FakePeer):
+        def do_GET(self):
+            paths.append(self.path)
+            assert self.path.startswith("/p/researcher/api/sessions")
+            self.path = self.path.removeprefix("/p/researcher")
+            super().do_GET()
+
+        def do_POST(self):
+            paths.append(self.path)
+            if not self.path.startswith("/p/researcher/api/sessions"):
+                return self._json({"error": {"message": "retired route"}}, 404)
+            self.path = self.path.removeprefix("/p/researcher")
+            super().do_POST()
+
+    ProfilePeer.sessions = []
+    ProfilePeer.chats = []
+    ProfilePeer.chat_bodies = []
+    ProfilePeer.auth_seen = []
+    server = HTTPServer(("127.0.0.1", 0), ProfilePeer)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setattr(peer_cmd, "_load_peers", lambda: {
+        "spark": {"url": f"http://127.0.0.1:{server.server_port}"}})
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: "fixture-key")
+    try:
+        rc = peer_cmd.cmd_peer(SimpleNamespace(
+            peer_action="dm", target="spark/researcher", message="ping", json=True))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["profile"] == "researcher"
+    assert ProfilePeer.chats == ["ping"]
+    assert all(path.startswith("/p/researcher/api/sessions") for path in paths)
+    assert len(paths) == 3  # Find, create, deliver; no optional endpoint probe.
 
 
 def test_dm_creates_bot_chat_then_chats(monkeypatch, capsys, fake_peer_server):
@@ -587,3 +633,234 @@ def test_request_strips_bearer_key_across_redirect_origin():
     assert all(header is None for header in _AttackerOrigin.auth_seen), (
         f"peer's Bearer key leaked to the redirect target: {_AttackerOrigin.auth_seen}"
     )
+
+
+def test_dm_budget_is_bounded_and_remaining_timeout_never_exceeds_request(monkeypatch):
+    monkeypatch.setattr(peer_cmd.time, "monotonic", lambda: 0.0)
+    assert peer_cmd.DM_TIMEOUT_S == 90
+    assert peer_cmd._remaining_timeout(10.0, 30.0) == 10.0
+    with pytest.raises(TimeoutError, match="deadline exceeded"):
+        peer_cmd._remaining_timeout(0.0, 30.0)
+
+
+class _SlowDripResponsePeer(BaseHTTPRequestHandler):
+    status = 200
+    body = b""
+    delay = 0.02
+
+    def _send_slow_response(self):
+        self.send_response(type(self).status)
+        self.send_header("Content-Type", "application/json")
+        # Deliberately omit Content-Length: the client must not wait for EOF
+        # from a peer that keeps a response body open.
+        self.end_headers()
+        for byte in type(self).body:
+            try:
+                self.wfile.write(bytes((byte,)))
+                self.wfile.flush()
+            except OSError:
+                return
+            time.sleep(type(self).delay)
+
+    def do_GET(self):
+        self._send_slow_response()
+
+    def do_POST(self):
+        self._send_slow_response()
+
+    def log_message(self, *args):  # noqa: D102 — silence test server logging
+        pass
+
+
+@pytest.fixture()
+def slow_drip_peer_server():
+    _SlowDripResponsePeer.status = 200
+    _SlowDripResponsePeer.body = b"x" * 200
+    server = HTTPServer(("127.0.0.1", 0), _SlowDripResponsePeer)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/slow"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_response_body_deadline_stops_a_slow_drip_peer(slow_drip_peer_server):
+    started = time.monotonic()
+
+    with pytest.raises(TimeoutError):
+        peer_cmd._request(slow_drip_peer_server, "secret-key-123456", timeout=0.25)
+
+    assert time.monotonic() - started < 1.5
+    # Cleanup is synchronous; no body reader or response-close helper may
+    # still be settling after the caller receives the timeout.
+    time.sleep(0.05)
+    assert [t.name for t in threading.enumerate() if t.name.startswith("hermes-peer-")] == []
+
+
+def test_http_error_detail_deadline_stops_a_slow_drip_error_body(slow_drip_peer_server, capsys):
+    _SlowDripResponsePeer.status = 409
+    started = time.monotonic()
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        peer_cmd._request(slow_drip_peer_server, "secret-key-123456", timeout=0.25)
+
+    assert peer_cmd._peer_failure(
+        "spark", exc_info.value, deadline=time.monotonic() + 0.25
+    ) == 1
+    assert time.monotonic() - started < 1.5
+    assert "unavailable before the deadline" in capsys.readouterr().err
+    time.sleep(0.05)
+    assert [t.name for t in threading.enumerate() if t.name.startswith("hermes-peer-")] == []
+
+
+def test_http_error_detail_reads_only_the_error_body_cap():
+    class _RecordingBody:
+        def __init__(self):
+            self.amounts = []
+
+        def read(self, amount=-1):
+            self.amounts.append(amount)
+            return b"x" * max(0, amount)
+
+        def close(self):
+            pass
+
+    body = _RecordingBody()
+    exc = urllib.error.HTTPError(
+        "http://spark/api/sessions/chat", 409, "conflict", {}, body
+    )
+
+    peer_cmd._http_error_detail(exc, deadline=time.monotonic() + 1)
+
+    assert body.amounts == [peer_cmd.HTTP_ERROR_BODY_MAX_BYTES + 1]
+
+
+def test_non_tty_stdin_deadline_interrupts_an_open_pipe(monkeypatch):
+    read_fd, write_fd = os.pipe()
+    reader = os.fdopen(read_fd, "r", encoding="utf-8")
+    writer = os.fdopen(write_fd, "w", encoding="utf-8")
+    processes = []
+    original_popen = peer_cmd.subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(peer_cmd.subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(peer_cmd.sys, "stdin", reader)
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match="reading stdin"):
+            peer_cmd._message_from_args(
+                type("Args", (), {"message": None})(),
+                deadline=time.monotonic() + 0.25,
+            )
+    finally:
+        try:
+            reader.close()
+        except OSError:
+            pass
+        writer.close()
+
+    assert time.monotonic() - started < 1.5
+    time.sleep(0.05)
+    assert processes and all(process.poll() is not None for process in processes)
+    assert [t.name for t in threading.enumerate() if t.name.startswith("hermes-peer-")] == []
+
+
+def test_non_tty_stdin_rejects_noncooperative_adapter_without_reading(monkeypatch):
+    class BlockingStream:
+        def __init__(self):
+            self.read_calls = 0
+            self.close_calls = 0
+
+        def isatty(self):
+            return False
+
+        def fileno(self):
+            raise ValueError("adapter has no fd")
+
+        def read(self):
+            self.read_calls += 1
+            raise AssertionError("non-cooperative adapter must not be read")
+
+        def close(self):
+            self.close_calls += 1
+
+    stream = BlockingStream()
+    monkeypatch.setattr(peer_cmd.sys, "stdin", stream)
+
+    with pytest.raises(TimeoutError, match="file-backed pipe"):
+        peer_cmd._message_from_args(
+            type("Args", (), {"message": None})(),
+            deadline=time.monotonic() + 0.08,
+        )
+
+    time.sleep(0.05)
+    assert stream.read_calls == 0
+    assert stream.close_calls == 0
+    assert [t.name for t in threading.enumerate() if t.name.startswith("hermes-peer-")] == []
+
+
+@pytest.mark.parametrize(
+    ("stream", "expected"),
+    [(io.StringIO("memory text\n"), "memory text"),
+     (io.BytesIO(b"memory bytes\n"), "memory bytes")],
+    ids=["stringio", "bytesio"],
+)
+def test_non_tty_stdin_reads_exact_in_memory_stream_synchronously(monkeypatch, stream, expected):
+    monkeypatch.setattr(peer_cmd.sys, "stdin", stream)
+
+    assert peer_cmd._message_from_args(
+        type("Args", (), {"message": None})(),
+        deadline=time.monotonic() + 1,
+    ) == expected
+    assert [t.name for t in threading.enumerate() if t.name.startswith("hermes-peer-")] == []
+
+
+def test_non_tty_stdin_reads_the_complete_pipe_before_network(monkeypatch):
+    read_fd, write_fd = os.pipe()
+    reader = os.fdopen(read_fd, "r", encoding="utf-8")
+    writer = os.fdopen(write_fd, "w", encoding="utf-8")
+    writer.write("first line\nsecond line\n")
+    writer.close()
+    monkeypatch.setattr(peer_cmd.sys, "stdin", reader)
+    try:
+        assert peer_cmd._message_from_args(
+            type("Args", (), {"message": None})(),
+            deadline=time.monotonic() + 5,
+        ) == "first line\nsecond line"
+    finally:
+        reader.close()
+
+
+def test_cmd_peer_starts_the_dm_budget_before_stdin(monkeypatch, capsys):
+    read_fd, write_fd = os.pipe()
+    reader = os.fdopen(read_fd, "r", encoding="utf-8")
+    writer = os.fdopen(write_fd, "w", encoding="utf-8")
+    monkeypatch.setattr(peer_cmd.sys, "stdin", reader)
+    monkeypatch.setattr(peer_cmd, "DM_TIMEOUT_S", 0.25)
+    monkeypatch.setattr(peer_cmd, "_load_peers", lambda: {"spark": {"url": "http://spark"}})
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: "secret-key-123456")
+    started = time.monotonic()
+    try:
+        rc = peer_cmd.cmd_peer(
+            type("Args", (), {
+                "peer_action": "dm",
+                "target": "spark",
+                "message": None,
+                "json": False,
+            })()
+        )
+    finally:
+        try:
+            reader.close()
+        except OSError:
+            pass
+        writer.close()
+
+    assert rc == 1
+    assert time.monotonic() - started < 1.5
+    assert "reading stdin" in capsys.readouterr().err

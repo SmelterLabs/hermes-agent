@@ -22,6 +22,13 @@ vi.mock('react-router', () => ({
   useNavigate: () => navigate
 }))
 
+// The local overlay ships the fleet rail disabled (selected-box-only strip);
+// force it on here so the upstream fleet behavior stays tested.
+vi.mock('./fleet-rail', async importOriginal => ({
+  ...(await importOriginal<typeof import('./fleet-rail')>()),
+  FLEET_RAIL_ENABLED: true
+}))
+
 vi.mock('@/i18n', () => ({
   useI18n: () => ({
     t: {
@@ -88,6 +95,7 @@ vi.mock('@/store/profile', () => ({
   $profileCreateRequest: atom(0),
   $profileOrder: atom([]),
   $profiles: atom([{ is_default: true, name: 'default' }]),
+  $profilesConnectionId: atom<null | string>(null),
   $profileScope: atom('default'),
   // The rail's status summary (profile-dot-state) rides the real session
   // stores, whose import graph reaches $showAllProfiles through layout state.
@@ -110,6 +118,7 @@ vi.mock('@/store/connections', () => ({
   $activeConnectionId: atom<null | string>(null),
   $connectionsRegistry: atom<DesktopConnectionsRegistry | null>(null),
   $hasMultipleConnections: atom(false),
+  $pendingConnectionId: atom<null | string>(null),
   selectConnection: (...args: unknown[]) => selectConnection(...args)
 }))
 
@@ -148,9 +157,10 @@ const connectionsRegistry = connectionsStore.$connectionsRegistry as ReturnType<
   typeof atom<DesktopConnectionsRegistry | null>
 >
 
-const { $activeGatewayProfile, $profileOrder, $profiles, $profileScope } = await import('@/store/profile')
+const { $activeGatewayProfile, $profileOrder, $profiles, $profilesConnectionId, $profileScope } = await import('@/store/profile')
 const activeGatewayProfile = $activeGatewayProfile as ReturnType<typeof atom<string>>
 const profiles = $profiles as ReturnType<typeof atom<Array<{ is_default: boolean; name: string }>>>
+const profilesConnectionId = $profilesConnectionId as ReturnType<typeof atom<null | string>>
 const profileScope = $profileScope as ReturnType<typeof atom<string>>
 const { _resetFleetRosterForTests } = await import('@/store/fleet-roster')
 
@@ -208,6 +218,7 @@ function armFleet() {
   hasMultipleConnections.set(true)
   connectionsRegistry.set(registry)
   activeConnectionId.set('gateway-a')
+  profilesConnectionId.set('gateway-a')
   profiles.set([
     { is_default: true, name: 'default' },
     { is_default: false, name: 'scout' }
@@ -246,6 +257,7 @@ afterEach(() => {
   connectionsRegistry.set(null)
   activeConnectionId.set(null)
   activeGatewayProfile.set('default')
+  profilesConnectionId.set(null)
   profileScope.set('default')
   profiles.set([{ is_default: true, name: 'default' }])
   delete (window as { hermesDesktop?: unknown }).hermesDesktop
@@ -346,6 +358,8 @@ describe('ProfileRail fleet mode', () => {
     async condensed => {
       armFleet()
       activeConnectionId.set('local')
+      // The overlay's strip guard blanks the rail unless the profile list belongs to the active source.
+      profilesConnectionId.set('local')
       profiles.set([
         { is_default: true, name: 'default' },
         { is_default: false, name: 'builder' },
@@ -613,6 +627,7 @@ describe('ProfileRail fleet mode', () => {
   it('keeps every group in its slot when a different gateway is active', async () => {
     armFleet()
     activeConnectionId.set('local')
+    profilesConnectionId.set('local')
     profiles.set([
       { is_default: true, name: 'default' },
       { is_default: false, name: 'builder' }

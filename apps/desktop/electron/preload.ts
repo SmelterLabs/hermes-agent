@@ -428,6 +428,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     cancel: id => ipcRenderer.invoke('hermes:mcp-oauth:cancel', id)
   },
   openPreviewInBrowser: url => ipcRenderer.invoke('hermes:openPreviewInBrowser', url),
+  autofillPreviewFromBitwarden: guestId => ipcRenderer.invoke('hermes:preview:bitwarden-autofill', guestId),
   reachPreviewUrl: url => ipcRenderer.invoke('hermes:preview:reach', url),
   setActiveConnectionRoute: route => ipcRenderer.send('hermes:connection:active-route', route),
   fetchLinkTitle: url => ipcRenderer.invoke('hermes:fetchLinkTitle', url),

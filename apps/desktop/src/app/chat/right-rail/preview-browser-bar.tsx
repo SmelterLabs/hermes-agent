@@ -38,6 +38,7 @@ interface PreviewBrowserBarProps {
   onClose?: () => void
   onFlushComments?: () => void
   onForward: () => void
+  onAutofill?: () => void
   onNavigate: (url: string) => void
   onOpenExternal?: () => void
   onPopIn?: () => void
@@ -108,6 +109,7 @@ export function PreviewBrowserBar({
   onClose,
   onFlushComments,
   onForward,
+  onAutofill,
   onNavigate,
   onOpenExternal,
   onPopIn,
@@ -167,6 +169,13 @@ export function PreviewBrowserBar({
         label={copy.reload}
         onSelect={onReload}
       />
+      {onAutofill ? (
+        <PaneStripGlyph
+          icon={<Codicon name="key" size="0.8125rem" />}
+          label="Fill from Bitwarden"
+          onSelect={onAutofill}
+        />
+      ) : null}
       {/* The copy control lives INSIDE the field, on its right edge — the
           same pre-faded inline icon code blocks use, not a toolbar button.
           It copies what the field shows: on a remote gateway, that is the

@@ -65,7 +65,7 @@ from hermes_state_dbfile import (
     quarantine_invalid_state_db,
     RetiredGenerationCaptureError, capture_retired_wal_generation, refuse_deleted_wal_generation,
 )
-from hermes_state_messages import SessionMessagesMixin
+from hermes_state_messages import SessionMessagesMixin, CLYDE_PROACTIVE_SESSION_ID
 from hermes_state_coverage import SessionCoverageMixin
 from hermes_state_rewind import SessionRewindMixin
 from hermes_state_wal import (

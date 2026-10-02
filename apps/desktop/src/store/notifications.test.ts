@@ -2,10 +2,18 @@ import { beforeEach, expect, test, vi } from 'vitest'
 
 import { en } from '@/i18n/en'
 
-import { $notifications, clearNotifications, isDiskFullErrorMessage, notifyError } from './notifications'
+import {
+  $notifications,
+  clearNotifications,
+  isDiskFullErrorMessage,
+  notifyError,
+  setToastMessagesEnabled
+} from './notifications'
 import { $backendRestartRequest, $routeRequest } from './recovery-requests'
 
 beforeEach(() => {
+  // The PC overlay ships in-app toasts suppressed; these tests assert on them.
+  setToastMessagesEnabled(true)
   clearNotifications()
 })
 

@@ -24,6 +24,7 @@
 //   trigger) so intra-word energy dips don't reset progress.
 
 import { closeMeterContext, meterContextsClosed } from '@/lib/mic-meter-context'
+import { bargeInTuning, DEFAULT_PLAYBACK_MIN_TRIGGER_LEVEL } from '@/lib/voice-tuning'
 import { $voiceSilenceMs } from '@/store/voice-prefs'
 
 const CALIBRATION_MS = 400
@@ -31,9 +32,7 @@ const SUSTAINED_MS = 300
 const SUSTAINED_MAJORITY = 0.8
 const MIN_TRIGGER_LEVEL = 0.075 // matches the voice loop's silenceLevel
 const FLOOR_MULTIPLIER = 3.5
-// Playback clamps, scaled from the Python constants (int16 RMS 1500 / 4000
-// ≈ byte-domain level 0.14 / 0.37 with the /42 normalization below).
-const PLAYBACK_MIN_TRIGGER_LEVEL = 0.14
+const PLAYBACK_MIN_TRIGGER_LEVEL = DEFAULT_PLAYBACK_MIN_TRIGGER_LEVEL
 const TRIGGER_CEILING_LEVEL = 0.37
 // Backend default for voice.barge_in_threshold_multiplier
 // (tools/voice_mode.DEFAULT_BARGE_MULTIPLIER); the levels above are tuned for it.
@@ -47,6 +46,9 @@ const PRE_ROLL_RESTART_MS = 5_000 // cap pre-roll: restart the recorder while qu
 // silence window the loop uses; read live per frame so a config refresh
 // mid-turn keeps the two matched.
 const UTTERANCE_MAX_MS = 30_000
+
+// Tunables (`voice.barge_in_threshold_multiplier`, `voice.barge_in_playback_floor`)
+// live in lib/voice-tuning — see that module.
 
 export interface BargeMonitorCallbacks {
   /** Sustained speech detected — cut playback / interrupt the turn now. */
@@ -90,6 +92,12 @@ export function bargeInTriggerLevels(thresholdMultiplier?: number | null): Barge
 
 export function monitorSpeechDuringPlayback(callbacks: BargeMonitorCallbacks): () => void {
   const { floorMultiplier, playbackMinTrigger } = bargeInTriggerLevels(callbacks.thresholdMultiplier)
+  // PC overlay: an explicit `voice.barge_in_playback_floor` (e.g. 0.09 for a quiet
+  // condenser mic on clyde-voice) wins over upstream's scaled playback minimum.
+  const playbackFloor =
+    bargeInTuning.playbackMinTriggerLevel !== DEFAULT_PLAYBACK_MIN_TRIGGER_LEVEL
+      ? bargeInTuning.playbackMinTriggerLevel
+      : playbackMinTrigger
   let disposed = false
   let stream: MediaStream | null = null
   let context: AudioContext | null = null
@@ -202,8 +210,12 @@ export function monitorSpeechDuringPlayback(callbacks: BargeMonitorCallbacks): (
         return
       }
 
+      // autoGainControl: a quiet mic (condenser at conservative gain) otherwise
+      // never reaches the playback trigger — the user has to shout to barge in.
+      // AGC lifts normal speech into the same range the thresholds were tuned
+      // for; the quiet-phase floor calibration below still guards against bleed.
       stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true }
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
       })
 
       if (disposed) {
@@ -298,7 +310,7 @@ export function monitorSpeechDuringPlayback(callbacks: BargeMonitorCallbacks): (
           let trigger = Math.max(MIN_TRIGGER_LEVEL, quietFloor * floorMultiplier)
 
           if (playing) {
-            trigger = Math.min(Math.max(trigger, playbackMinTrigger), TRIGGER_CEILING_LEVEL)
+            trigger = Math.min(Math.max(trigger, playbackFloor), TRIGGER_CEILING_LEVEL)
           }
 
           // Track ambient drift while quiet and below trigger.

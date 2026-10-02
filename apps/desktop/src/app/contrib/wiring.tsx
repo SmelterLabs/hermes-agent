@@ -63,6 +63,7 @@ import {
 import { $previewTarget } from '@/store/preview'
 import {
   $activeGatewayProfile,
+  $newChatProfile,
   $profileScope,
   ALL_PROFILES,
   ensureGatewayProfile,
@@ -569,7 +570,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // "branch off into a new worktree" flow keeps the fresh-draft path — it
   // prefills the MAIN composer right after, so it has to own that surface.
   const startSessionInWorkspace = useCallback(
-    (path: null | string, options?: { openTab?: boolean }) => {
+    (path: null | string, options?: { openTab?: boolean; profile?: string }) => {
+      $newChatProfile.set(
+        normalizeProfileKey(options?.profile ?? $activeGatewayProfile.get())
+      )
       setWorkspaceScope('sessions')
 
       if (options?.openTab && mainChatOccupied(activeSessionIdRef.current, $selectedStoredSessionId.get())) {
@@ -1117,7 +1121,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       navigate(CRON_ROUTE)
     },
     onNavigate: selectSidebarItem,
-    onNewSessionInWorkspace: path => startSessionInWorkspace(path, { openTab: true }),
+    onNewSessionInWorkspace: (path, profile) => startSessionInWorkspace(path, { openTab: true, profile }),
     onNewSessionSplit: (dir, opts) =>
       void openNewSessionTile(dir, {
         ...opts,

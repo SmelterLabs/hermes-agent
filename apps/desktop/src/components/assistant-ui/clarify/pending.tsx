@@ -1,7 +1,7 @@
 'use client'
 
 import { useStore } from '@nanostores/react'
-import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { type FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { Loader } from '@/components/ui/loader'
 import { useI18n } from '@/i18n'
@@ -27,6 +27,16 @@ import { useClarifyKeys } from './core/use-clarify-keys'
 import type { ClarifyArgs } from './parse'
 import { handleClarifySubmitShortcut } from './submit-shortcut'
 import { UndeliveredNotice } from './undelivered-notice'
+
+type ClarifyStage = Record<string, { choices: string[]; draft: string }>
+
+// Transcript reconciliation can remount tool parts while the same request is
+// still open. Retain drafts by backend identity until confirm or skip.
+const clarifyDrafts = new Map<string, ClarifyStage>()
+
+export function resetClarifyDraftsForTests(): void {
+  clarifyDrafts.clear()
+}
 
 /** Live batch card: all questions at once, staged locally, ONE confirm.
  * Picks and drafts stay in component state — nothing reaches the server
@@ -74,7 +84,24 @@ export function ClarifyToolPending({
 
   const questions = ready ? liveQuestions : previewQuestions
 
-  const [staged, setStaged] = useState<Record<string, { choices: string[]; draft: string }>>({})
+  const draftKey = request ? `${request.sessionId}\0${request.requestId}` : null
+  const [staged, setStagedState] = useState<ClarifyStage>(() => (draftKey ? (clarifyDrafts.get(draftKey) ?? {}) : {}))
+
+  const setStaged = useCallback(
+    (update: ClarifyStage | ((current: ClarifyStage) => ClarifyStage)) => {
+      setStagedState(current => {
+        const next = typeof update === 'function' ? update(current) : update
+
+        if (draftKey) {
+          clarifyDrafts.set(draftKey, next)
+        }
+
+        return next
+      })
+    },
+    [draftKey]
+  )
+
   const [submitting, setSubmitting] = useState(false)
 
   // Locked answers (a reconnect replay, or text typed in the composer) stage
@@ -208,6 +235,11 @@ export function ClarifyToolPending({
       forgetServerRequest(request.requestId)
 
       triggerHaptic('submit')
+
+      if (draftKey) {
+        clarifyDrafts.delete(draftKey)
+      }
+
       onAnswered()
       // tool.complete lands next → ClarifyToolSettled.
       clearClarifyRequest(request.requestId, request.sessionId)
@@ -215,43 +247,53 @@ export function ClarifyToolPending({
       notifyError(error, copy.sendFailed)
       setSubmitting(false)
     }
-  }, [copy, gateway, onAnswered, questions, request, stagedAnswer])
+  }, [copy, draftKey, gateway, onAnswered, questions, request, stagedAnswer])
 
-  const toggleChoice = useCallback((question: ClarifyQuestion, choice: string) => {
-    setStaged(current => {
-      const stage = current[question.qid] ?? emptyStage
+  const toggleChoice = useCallback(
+    (question: ClarifyQuestion, choice: string) => {
+      setStaged(current => {
+        const stage = current[question.qid] ?? emptyStage
 
-      const next = question.multiSelect
-        ? stage.choices.includes(choice)
-          ? stage.choices.filter(value => value !== choice)
-          : [...stage.choices, choice]
-        : [choice]
+        const next = question.multiSelect
+          ? stage.choices.includes(choice)
+            ? stage.choices.filter(value => value !== choice)
+            : [...stage.choices, choice]
+          : [choice]
 
-      // Multi-select keeps the typed text alongside the toggled choices;
-      // single-select stays mutually exclusive.
-      return { ...current, [question.qid]: { choices: next, draft: question.multiSelect ? stage.draft : '' } }
-    })
-  }, [])
+        // Multi-select keeps the typed text alongside the toggled choices;
+        // single-select stays mutually exclusive.
+        return { ...current, [question.qid]: { choices: next, draft: question.multiSelect ? stage.draft : '' } }
+      })
+    },
+    [setStaged]
+  )
 
-  const draftFor = useCallback((question: ClarifyQuestion, value: string) => {
-    setStaged(current => {
-      const stage = current[question.qid] ?? emptyStage
+  const draftFor = useCallback(
+    (question: ClarifyQuestion, value: string) => {
+      setStaged(current => {
+        const stage = current[question.qid] ?? emptyStage
 
-      // Multi-select keeps the staged choices while the free-text field is
-      // edited; single-select stays mutually exclusive.
-      return { ...current, [question.qid]: { choices: question.multiSelect ? stage.choices : [], draft: value } }
-    })
-  }, [])
+        // Multi-select keeps the staged choices while the free-text field is
+        // edited; single-select stays mutually exclusive.
+        return { ...current, [question.qid]: { choices: question.multiSelect ? stage.choices : [], draft: value } }
+      })
+    },
+    [setStaged]
+  )
 
   const cancelAll = useCallback(async () => {
     if (!request) {
       return
     }
 
+    if (draftKey) {
+      clarifyDrafts.delete(draftKey)
+    }
+
     onAnswered()
     // A response with no `answers` is the cancel-all (the plain Esc path).
     skipClarify(request)
-  }, [onAnswered, request])
+  }, [draftKey, onAnswered, request])
 
   const handleSubmit = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
@@ -264,9 +306,12 @@ export function ClarifyToolPending({
     [canConfirm, confirmAll, ready]
   )
 
-  const clearStage = useCallback((question: ClarifyQuestion) => {
-    setStaged(current => ({ ...current, [question.qid]: emptyStage }))
-  }, [])
+  const clearStage = useCallback(
+    (question: ClarifyQuestion) => {
+      setStaged(current => ({ ...current, [question.qid]: emptyStage }))
+    },
+    [setStaged]
+  )
 
   const isStaged = useCallback((question: ClarifyQuestion) => stagedAnswer(question) !== null, [stagedAnswer])
 
@@ -284,6 +329,34 @@ export function ClarifyToolPending({
 
   const disabled = submitting || !ready
 
+  const handleKeyDown = (event: KeyboardEvent<HTMLFormElement>) => {
+    if (
+      event.key !== 'Enter' ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.altKey ||
+      event.shiftKey ||
+      event.nativeEvent.isComposing ||
+      event.defaultPrevented
+    ) {
+      return
+    }
+
+    const target = event.target
+
+    if (!(target instanceof HTMLButtonElement) || !target.hasAttribute('data-choice') || !canConfirm) {
+      return
+    }
+
+    // A focused choice's native Enter must confirm staged answers, not toggle
+    // that choice again. Unanswered questions retain upstream partial semantics.
+    event.preventDefault()
+
+    if (ready && !submitting) {
+      void confirmAll()
+    }
+  }
+
   if (questions.length === 0) {
     return (
       <ClarifyShell aria-label={copy.loadingQuestion} className="my-1.5 grid min-h-12 place-items-center" role="status">
@@ -299,6 +372,7 @@ export function ClarifyToolPending({
       data-clarify-batch={questions.length}
       data-clarify-batch-preview={ready ? undefined : ''}
       data-clarify-choices={ready ? questions[keys.activeQuestion]?.choices?.length || undefined : undefined}
+      onKeyDown={handleKeyDown}
       onKeyDownCapture={handleClarifySubmitShortcut}
       onSubmit={handleSubmit}
       ref={formRef}

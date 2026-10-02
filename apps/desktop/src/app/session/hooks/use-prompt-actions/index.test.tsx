@@ -4,6 +4,7 @@ import { act, cleanup, render, waitFor } from '@testing-library/react'
 import type { MutableRefObject } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { SESSION_RESUME_REQUEST_TIMEOUT_MS } from '@/api/client'
 import { getLatestSessionMessages, getSession } from '@/hermes'
 import { en } from '@/i18n/en'
 import { textPart } from '@/lib/chat-messages'
@@ -15,9 +16,10 @@ import { $confirmRequest, settleConfirm } from '@/store/confirm'
 import { requestGatewayForAgent } from '@/store/gateway'
 import { $goalsBySession, setSessionGoal } from '@/store/goals'
 import { $hudMode } from '@/store/hud'
-import { $notifications, clearNotifications } from '@/store/notifications'
+import { $notifications, clearNotifications, setToastMessagesEnabled } from '@/store/notifications'
 import { $cronRunReadOnlyVerdicts } from '@/store/read-only-transcript'
 import {
+  $activeSessionId,
   $busy,
   $connection,
   $currentCwd,
@@ -25,6 +27,8 @@ import {
   $messages,
   $sessions,
   $terminalBackend,
+  $turnStartedAt,
+  setActiveSessionId,
   setCurrentUsage,
   setMessages,
   setSessions
@@ -47,6 +51,9 @@ beforeEach(() => {
   window.localStorage.removeItem('hermes.desktop.composerQueue.v1')
   vi.mocked(getLatestSessionMessages).mockReset()
   vi.mocked(getLatestSessionMessages).mockImplementation(async () => ({ messages: [], session_id: 'session' }))
+  setActiveSessionId(null)
+  // This PC ships with toasts suppressed; the suite asserts on them.
+  setToastMessagesEnabled(true)
 })
 
 vi.mock('@/hermes', () => ({
@@ -2409,6 +2416,50 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(armed as number).toBeLessThanOrEqual(Date.now())
   })
 
+  it('publishes a directly resumed foreground runtime before its turn events arrive', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: 'rt-stale' }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: 'stored-session-a' }
+    let boundRuntimeId: null | string = null
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        boundRuntimeId = 'rt-recovered'
+
+        return { session_id: boundRuntimeId } as never
+      }
+
+      return {} as never
+    })
+
+    setActiveSessionId('rt-stale')
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId="rt-stale"
+        activeSessionIdRef={activeSessionIdRef}
+        getRoutedStoredSessionId={() => 'stored-session-a'}
+        getRuntimeIdForStoredSession={() => boundRuntimeId}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        resumeStoredSession={async () => undefined}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId="stored-session-a"
+      />
+    )
+
+    await handle!.submitText('ask the user a question')
+
+    expect(activeSessionIdRef.current).toBe('rt-recovered')
+    expect($activeSessionId.get()).toBe('rt-recovered')
+    expect(requestGateway).toHaveBeenCalledWith(
+      'prompt.submit',
+      { session_id: 'rt-recovered', text: 'ask the user a question' },
+      1_800_000
+    )
+  })
+
   it('keeps a live turn clock when a second seed races it (?? guard)', async () => {
     const seeds: Record<string, unknown>[] = []
     const requestGateway = vi.fn(async () => ({}) as never)
@@ -2578,11 +2629,15 @@ describe('usePromptActions submit / queue drain semantics', () => {
     })
 
     expect(accepted).toBe(true)
-    expect(requestGateway).toHaveBeenCalledWith('session.resume', {
-      session_id: 'stored-session-b',
-      source: 'desktop',
-      omit_messages: true
-    })
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.resume',
+      {
+        session_id: 'stored-session-b',
+        source: 'desktop',
+        omit_messages: true
+      },
+      SESSION_RESUME_REQUEST_TIMEOUT_MS
+    )
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
@@ -2809,11 +2864,15 @@ describe('usePromptActions submit / queue drain semantics', () => {
 
     expect(accepted).toBe(true)
     // Must resume the correct stored session to get the right runtime id.
-    expect(requestGateway).toHaveBeenCalledWith('session.resume', {
-      session_id: 'stored-session-a',
-      source: 'desktop',
-      omit_messages: true
-    })
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.resume',
+      {
+        session_id: 'stored-session-a',
+        source: 'desktop',
+        omit_messages: true
+      },
+      SESSION_RESUME_REQUEST_TIMEOUT_MS
+    )
     // The prompt must land in the resumed session, NOT the foreground.
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',

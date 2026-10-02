@@ -1,6 +1,10 @@
 import type { PromptSubmitResult } from '@hermes/shared'
 import { type MutableRefObject, useCallback } from 'react'
 
+// SESSION_RESUME_… comes from the leaf module, NOT the '@/hermes' barrel:
+// dozens of test files mock '@/hermes' with closed factories that would have
+// to each grow the new export, while nothing mocks the leaf.
+import { SESSION_RESUME_REQUEST_TIMEOUT_MS } from '@/api/client'
 import { getSession, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import { translateNow, type Translations } from '@/i18n'
 import { type ChatMessage, finalizeInterruptedMessages, textPart } from '@/lib/chat-messages'
@@ -822,7 +826,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
                   source: 'desktop',
                   omit_messages: true,
                   ...(resumeProfile ? { profile: resumeProfile } : {})
-                })
+                }, SESSION_RESUME_REQUEST_TIMEOUT_MS)
               })
 
           const resumeDrift = sessionDriftReason()

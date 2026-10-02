@@ -1,7 +1,7 @@
 """``hermes peer`` — bot-to-bot DMs across machines/gateways.
 
 A *peer* is another Hermes gateway running the ``api_server`` platform; its stock
-API is the transport (no new server surface). ``dm`` resolves the remote canonical
+API is the transport. ``dm`` resolves the remote canonical
 "Bot Chat" session (creating it when missing) and runs ONE synchronous turn — the
 cross-machine twin of ``hermes -p <bot> chat --in ~ -c "Bot Chat"``. ``run``/``status``
 /``stop`` do the same turn through the async Runs API. Peer labels/URLs live in
@@ -12,9 +12,13 @@ config.yaml (``bot_peers``); the key lives in ``~/.hermes/.env`` as
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import re
+import socket
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,9 +28,21 @@ BOT_CHAT_TITLE = "Bot Chat"
 _PEER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _PROFILE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
-# One synchronous agent turn can legitimately take minutes.
-DM_TIMEOUT_S = 600
+# Peer DMs are synchronous, but must not hold a sender indefinitely while the
+# remote project turn is blocked. Keep this as a wall-clock budget, not merely
+# urllib's per-socket-operation timeout.
+DM_TIMEOUT_S = 90
 LIST_TIMEOUT_S = 30
+RESPONSE_BODY_MAX_BYTES = 1024 * 1024
+HTTP_ERROR_BODY_MAX_BYTES = 64 * 1024
+_MEMORY_STDIN_TYPES = (io.StringIO, io.BytesIO)
+_FILE_STDIN_TYPES = (
+    io.TextIOWrapper,
+    io.BufferedReader,
+    io.BufferedRandom,
+    io.BufferedRWPair,
+    io.FileIO,
+)
 
 
 def _peer_key_env(name: str) -> str:
@@ -64,7 +80,8 @@ def _peer_secret(name: str) -> str:
 
 def _request(
     url: str, key: str, *, method: str = "GET", body: dict | None = None,
-    timeout: int = LIST_TIMEOUT_S, headers: dict[str, str] | None = None) -> dict:
+    timeout: float = LIST_TIMEOUT_S, headers: dict[str, str] | None = None,
+    deadline: float | None = None) -> dict:
     from hermes_cli.urllib_security import open_credentialed_url
     data = json.dumps(body).encode("utf-8") if body is not None else None
     request_headers = {
@@ -77,8 +94,12 @@ def _request(
     # different origin must not carry the Authorization: Bearer key with it —
     # a compromised/MITM'd peer could otherwise harvest it. open_credentialed_url
     # strips non-safelisted headers across a cross-origin redirect.
+    request_deadline = time.monotonic() + timeout
+    if deadline is not None:
+        request_deadline = min(request_deadline, deadline)
+        timeout = _remaining_timeout(request_deadline, timeout)
     with open_credentialed_url(req, timeout=timeout) as resp:
-        payload = resp.read().decode("utf-8", "replace")
+        payload = _read_response_body(resp, request_deadline).decode("utf-8", "replace")
     try:
         parsed = json.loads(payload)
     except ValueError as exc:
@@ -86,6 +107,121 @@ def _request(
     if not isinstance(parsed, dict):
         raise RuntimeError("Peer returned a non-object JSON response")
     return parsed
+
+
+def _remaining_timeout(deadline: float, requested: float) -> float:
+    """Return the remaining wall-clock budget or fail before another request."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Peer DM deadline exceeded")
+    return min(float(requested), remaining)
+
+
+def _read_response_body(response, deadline: float, *, max_bytes: int = RESPONSE_BODY_MAX_BYTES) -> bytes:
+    """Read a response with a true wall-clock deadline.
+
+    ``urllib``'s timeout is an inactivity timeout and a streaming NDJSON peer
+    can reset it forever. ``HTTPResponse.read1`` performs at most one
+    underlying socket read, so refresh the socket timeout from the absolute
+    deadline before every bounded read. This keeps cancellation in the caller
+    thread: a timed-out response cannot leave a body reader or close worker
+    behind.
+    """
+    reader = getattr(response, "read1", None)
+    read_response = response
+    if not callable(reader):
+        # HTTPError wraps its body and does not expose HTTPResponse.read1.
+        # Prefer the wrapped HTTPResponse's one-system-call primitive before
+        # falling back to the wrapper's bounded read for simple body adapters.
+        read_response = getattr(response, "fp", None)
+        reader = getattr(read_response, "read1", None)
+        if not callable(reader):
+            read_response = response
+            reader = getattr(response, "read", None)
+    if not callable(reader):
+        raise TypeError("Peer response body is not readable")
+
+    chunks: list[bytes] = []
+    total = 0
+    while total < max_bytes + 1:
+        remaining = _remaining_timeout(deadline, DM_TIMEOUT_S)
+        sock = _response_socket(read_response)
+        if sock is not None:
+            sock.settimeout(remaining)
+        try:
+            # Read one byte over the cap so a fast, oversized response is
+            # bounded without buffering the whole body. ``read1`` avoids a
+            # hidden unbounded buffered read on real HTTPResponse objects.
+            chunk = reader(max_bytes + 1 - total)
+        except TimeoutError as exc:
+            _abort_quietly(response)
+            raise TimeoutError("Peer DM deadline exceeded while reading response body") from exc
+        if not chunk:
+            break
+        if not isinstance(chunk, (bytes, bytearray, memoryview)):
+            raise TypeError("Peer response body was not bytes")
+        chunk_bytes = bytes(chunk)
+        room = max_bytes + 1 - total
+        if len(chunk_bytes) > room:
+            chunk_bytes = chunk_bytes[:room]
+        chunks.append(chunk_bytes)
+        total += len(chunk_bytes)
+
+    if time.monotonic() >= deadline:
+        _abort_quietly(response)
+        raise TimeoutError("Peer DM deadline exceeded while reading response body")
+    return b"".join(chunks)[:max_bytes]
+
+
+def _close_quietly(resource) -> None:
+    sock = _response_socket(resource)
+    if sock is not None:
+        _shutdown_socket(sock)
+    _close_resource(resource)
+
+
+def _abort_quietly(resource) -> None:
+    """Interrupt and close a response synchronously before returning."""
+    sock = _response_socket(resource)
+    if sock is not None:
+        _shutdown_socket(sock)
+    _close_resource(resource)
+
+
+def _shutdown_socket(sock) -> None:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _close_resource(resource) -> None:
+    close = getattr(resource, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def _response_socket(response):
+    """Find the socket through either a response or an HTTPError wrapper."""
+    current = response
+    seen: set[int] = set()
+    for _ in range(6):
+        if current is None or id(current) in seen:
+            return None
+        seen.add(id(current))
+        raw = getattr(current, "raw", None)
+        sock = getattr(raw, "_sock", None)
+        if sock is not None:
+            return sock
+        current = getattr(current, "fp", None)
+    return None
 
 
 def _base_url(peer: dict, profile: str | None) -> str:
@@ -96,7 +232,7 @@ def _base_url(peer: dict, profile: str | None) -> str:
     return url
 
 
-def _find_bot_chat(base: str, key: str) -> str | None:
+def _find_bot_chat(base: str, key: str, *, deadline: float | None = None) -> str | None:
     """The remote canonical Bot Chat's session id, or None.
 
     Bot Mode always HIDES canonical chats, so the plain listing (which
@@ -108,23 +244,24 @@ def _find_bot_chat(base: str, key: str) -> str | None:
     to exactly the previous behavior against them.
     """
     query = urllib.parse.urlencode({"limit": 200, "title": BOT_CHAT_TITLE, "include_hidden": 1})
-    listing = _request(f"{base}/api/sessions?{query}", key)
+    listing = _request(f"{base}/api/sessions?{query}", key, deadline=deadline)
     for session in listing.get("data") or []:
         if isinstance(session, dict) and (session.get("title") or "").strip() == BOT_CHAT_TITLE:
             return str(session.get("id") or "") or None
     return None
 
 
-def _ensure_bot_chat(base: str, key: str) -> str:
-    existing = _find_bot_chat(base, key)
+def _ensure_bot_chat(base: str, key: str, *, deadline: float | None = None) -> str:
+    existing = _find_bot_chat(base, key, deadline=deadline)
     if existing:
         return existing
     try:
         created = _request(
             f"{base}/api/sessions", key, method="POST",
-            body={"title": BOT_CHAT_TITLE, "source": "bot_peer_dm"})
+            body={"title": BOT_CHAT_TITLE, "source": "bot_peer_dm"},
+            deadline=deadline)
     except urllib.error.HTTPError as exc:
-        detail = _http_error_detail(exc)
+        detail = _http_error_detail(exc, deadline=deadline)
         if exc.code == 400 and "title" in detail.lower():
             # Older peer (no title/include_hidden lookup support): its
             # canonical Bot Chat exists but is hidden, so we couldn't see it
@@ -156,14 +293,31 @@ def _parse_target(target: str) -> tuple[str, str | None]:
     return peer, profile
 
 
-def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+def _http_error_detail(exc: urllib.error.HTTPError, *, deadline: float | None = None) -> str:
+    error_deadline = deadline if deadline is not None else time.monotonic() + DM_TIMEOUT_S
     try:
-        body = exc.read().decode("utf-8", "replace")
+        body = _read_response_body(
+            exc, error_deadline, max_bytes=HTTP_ERROR_BODY_MAX_BYTES
+        ).decode("utf-8", "replace")
         parsed = json.loads(body)
-        message = parsed.get("error", {}).get("message") if isinstance(parsed, dict) else None
-        return message or body[:200]
+        if isinstance(parsed, dict):
+            error_value = parsed.get("error")
+            if isinstance(error_value, dict):
+                message = error_value.get("message")
+                code = error_value.get("code")
+            else:
+                message = error_value
+                code = parsed.get("code")
+            if code and message:
+                return f"{code}: {message}"
+            return str(message or code or body[:200] or str(exc))
+        return body[:200] or str(exc)
+    except (TimeoutError, OSError):
+        return f"{exc} (error response body unavailable before the deadline)"
     except Exception:
         return str(exc)
+    finally:
+        _close_quietly(exc)
 
 
 def _resolve_peer_target(target: str) -> tuple[str, str | None, dict, str]:
@@ -180,10 +334,97 @@ def _resolve_peer_target(target: str) -> tuple[str, str | None, dict, str]:
     return peer_name, profile, peer, key
 
 
-def _message_from_args(args) -> str:
+def _read_stdin_until(deadline: float) -> str:
+    """Acquire all non-TTY stdin before the same bounded DM operation ends.
+
+    A pipe may remain open indefinitely. Real file-backed stdin is read by a
+    killable helper process, which is synchronously terminated and reaped on
+    timeout. Only the exact stdlib in-memory streams are read synchronously;
+    arbitrary adapters are rejected without invoking ``read`` because a
+    Python reader thread cannot be safely cancelled.
+    """
+    stream = sys.stdin
+    if type(stream) is io.StringIO:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Peer DM deadline exceeded while reading stdin")
+        value = stream.read()
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Peer DM deadline exceeded while reading stdin")
+        return value
+    if type(stream) is io.BytesIO:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Peer DM deadline exceeded while reading stdin")
+        value = stream.read()
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Peer DM deadline exceeded while reading stdin")
+        return value.decode(getattr(stream, "encoding", None) or "utf-8", errors="replace")
+    # Do not probe arbitrary adapter methods: a custom ``fileno`` can block
+    # just as irreversibly as a custom ``read``. These are the stdlib wrappers
+    # used for real file-backed stdin; exact in-memory streams were handled
+    # above.
+    if type(stream) not in _FILE_STDIN_TYPES:
+        raise TimeoutError(
+            "Peer DM stdin must be a file-backed pipe or an exact in-memory stream"
+        )
+    try:
+        stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        raise TimeoutError(
+            "Peer DM stdin must be a file-backed pipe or an exact in-memory stream"
+        )
+
+    remaining = _remaining_timeout(deadline, DM_TIMEOUT_S)
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read())"],
+            stdin=stream,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding=encoding,
+            errors="replace",
+        )
+    except (OSError, ValueError):
+        raise TimeoutError("Peer DM stdin could not be read through its file descriptor")
+    try:
+        output, _ = process.communicate(timeout=remaining)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            process.kill()
+        except OSError:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        try:
+            process.communicate()
+        finally:
+            # ``kill`` is expected to be reliable for this private helper.
+            # Wait synchronously as a final invariant: returning while the
+            # child is still being reaped would violate the DM lifetime.
+            if process.poll() is None:
+                process.wait()
+        raise TimeoutError("Peer DM deadline exceeded while reading stdin") from exc
+    if time.monotonic() >= deadline:
+        raise TimeoutError("Peer DM deadline exceeded while reading stdin")
+    if process.returncode:
+        raise RuntimeError(f"Peer stdin reader exited with status {process.returncode}")
+    return output or ""
+
+
+def _message_from_args(args, *, deadline: float | None = None) -> str:
     message = (getattr(args, "message", None) or "").strip()
-    if not message and not sys.stdin.isatty():
-        message = sys.stdin.read().strip()
+    if message:
+        return message
+    stream = sys.stdin
+    if type(stream) not in _MEMORY_STDIN_TYPES + _FILE_STDIN_TYPES:
+        raise TimeoutError(
+            "Peer DM stdin must be a file-backed pipe or an exact in-memory stream"
+        )
+    if not stream.isatty():
+        input_deadline = deadline if deadline is not None else time.monotonic() + DM_TIMEOUT_S
+        message = _read_stdin_until(input_deadline).strip()
     return message
 
 
@@ -202,10 +443,10 @@ def _peer_run_durability(base: str, key: str) -> bool | None:
     return bool(contract.get("durable"))
 
 
-def _peer_failure(peer_name: str, exc: Exception) -> int:
+def _peer_failure(peer_name: str, exc: Exception, *, deadline: float | None = None) -> int:
     """Print a peer HTTP rejection or transport failure to stderr; always exit 1."""
     if isinstance(exc, urllib.error.HTTPError):
-        detail = _http_error_detail(exc)
+        detail = _http_error_detail(exc, deadline=deadline)
         print(f"Peer '{peer_name}' rejected the request (HTTP {exc.code}): {detail}",
               file=sys.stderr)
     else:
@@ -342,13 +583,16 @@ def _peer_run(args, message: str, peer_name: str, profile: str | None, base: str
         f"idempotency_key: {idempotency_key}"])
 
 
-def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str, key: str) -> int:
+def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str, key: str,
+             *, deadline: float | None = None) -> int:
     session_id = ""
+    deadline = deadline if deadline is not None else time.monotonic() + DM_TIMEOUT_S
     try:
-        session_id = _ensure_bot_chat(base, key)
+        session_id = _ensure_bot_chat(base, key, deadline=deadline)
         result = _request(
             f"{base}/api/sessions/{urllib.parse.quote(session_id, safe='')}/chat", key,
-            method="POST", body=_turn_body(message, message_key="message"), timeout=DM_TIMEOUT_S)
+            method="POST", body=_turn_body(message, message_key="message"),
+            timeout=DM_TIMEOUT_S, deadline=deadline)
     except RuntimeError as exc:
         print(f"Peer '{peer_name}': {exc}", file=sys.stderr)
         return 1
@@ -364,7 +608,7 @@ def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str,
                   "and will be answered there. The reply cannot come back on this call. Do NOT resend.",
                   file=sys.stderr)
             return 1
-        return _peer_failure(peer_name, exc)
+        return _peer_failure(peer_name, exc, deadline=deadline)
     if result.get("object") == "hermes.session.chat.queued":
         # The peer's Bot Chat is open in its Desktop and that turn outlasted the peer's wait: the
         # message is in the open chat and is answered there, so a resend would run it twice.
@@ -412,12 +656,18 @@ def cmd_peer(args) -> int:
     base = _base_url(peer, profile)
     if action in {"status", "stop"}:
         return _peer_run_ctl(args, action, peer_name, profile, base, key)
-    message = _message_from_args(args)
+    deadline = time.monotonic() + DM_TIMEOUT_S if action == "dm" else None
+    try:
+        message = _message_from_args(args, deadline=deadline)
+    except TimeoutError as exc:
+        print(f"Peer '{peer_name}': {exc}", file=sys.stderr)
+        return 1
     if not message:
         print("Message required (argument or stdin).", file=sys.stderr)
         return 2
-    handler = _peer_run if action == "run" else _peer_dm
-    return handler(args, message, peer_name, profile, base, key)
+    if action == "run":
+        return _peer_run(args, message, peer_name, profile, base, key)
+    return _peer_dm(args, message, peer_name, profile, base, key, deadline=deadline)
 
 
 def build_peer_parser(subparsers) -> None:
