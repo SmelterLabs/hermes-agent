@@ -53,7 +53,7 @@ import { useMessagesBelow } from './use-messages-below'
 import { useStickyPromptClip } from './use-sticky-prompt-clip'
 import { useTimelineReveal } from './use-timeline-reveal'
 
-type ThreadMessageComponents = ComponentProps<typeof ThreadPrimitive.MessageByIndex>['components']
+type ThreadMessageComponents = ComponentProps<typeof ThreadPrimitive.Unstable_MessageById>['components']
 
 export type MessageGroup = { id: string; weight: number } & (
   { index: number; kind: 'standalone' } | { indices: number[]; kind: 'turn' }
@@ -458,7 +458,7 @@ const TurnRow = memo(function TurnRow({ components, group, resetKey, virtualized
             <ResponseMessages components={components} indices={group.indices} />
           </div>
         ) : (
-          <ThreadPrimitive.MessageByIndex components={components} index={group.index} />
+          <ThreadPrimitive.Unstable_MessageById components={components} messageId={group.id} />
         )}
       </MessageRenderBoundary>
     </div>
