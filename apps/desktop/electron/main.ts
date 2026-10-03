@@ -106,13 +106,13 @@ import {
   shouldLatchSshClientFailure,
   sshClientFailedError
 } from './backend-start-failure'
-import { describeBootstrapFailure } from './bootstrap-failure-copy'
 import {
   fillBitwardenLogin,
   listBitwardenLogins,
   previewGuestBelongsToSender,
   validateCredentialUrl
 } from './bitwarden-autofill'
+import { describeBootstrapFailure } from './bootstrap-failure-copy'
 import {
   detectRemoteDisplay,
   isWindowsBinaryPathInWsl,

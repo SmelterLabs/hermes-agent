@@ -3,9 +3,12 @@
 // refusals it can mean so the card and toast read like a classified turn:
 // plain words up front, raw text demoted to the detail line, and Retry gone
 // where retrying reproduces the failure.
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $notifications } from '@/store/notifications'
+import { $notifications, setToastMessagesEnabled } from '@/store/notifications'
+
+// Local overlay ships toasts suppressed by default; these assertions read the toast store.
+beforeEach(() => setToastMessagesEnabled(true))
 import { requestDesktopOnboarding } from '@/store/onboarding'
 
 import { handleStatusEvent } from './status'

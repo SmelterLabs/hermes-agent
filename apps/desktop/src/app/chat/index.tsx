@@ -182,11 +182,7 @@ function ChatHeader({
         }}
       >
         {showProfileTag && (
-          <ProfileTag
-            className="pointer-events-auto mr-1.5"
-            connectionId={activeStoredSession?.connection_id}
-            profile={activeStoredSession?.profile}
-          />
+          <ProfileTag className="pointer-events-auto mr-1.5" profile={activeStoredSession?.profile} />
         )}
         <SessionActionsMenu
           align="start"

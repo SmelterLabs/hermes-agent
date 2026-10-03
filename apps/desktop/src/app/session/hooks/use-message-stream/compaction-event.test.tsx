@@ -9,7 +9,10 @@ import {
   setSessionCompacting,
   takeCompressDeferred
 } from '@/store/compaction'
-import { $notifications, clearNotifications } from '@/store/notifications'
+import { $notifications, clearNotifications, setToastMessagesEnabled } from '@/store/notifications'
+
+// Local overlay ships toasts suppressed by default; these assertions read the toast store.
+beforeEach(() => setToastMessagesEnabled(true))
 
 import { type MessageStreamHarness, renderMessageStream } from './test-harness'
 

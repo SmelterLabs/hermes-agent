@@ -1,6 +1,9 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $notifications, clearNotifications } from '@/store/notifications'
+import { $notifications, clearNotifications, setToastMessagesEnabled } from '@/store/notifications'
+
+// Local overlay ships toasts suppressed by default; these assertions read the toast store.
+beforeEach(() => setToastMessagesEnabled(true))
 import { $approvalRequests, clearApprovalRequest, setApprovalRequest } from '@/store/prompts'
 import { $routeRequest } from '@/store/recovery-requests'
 

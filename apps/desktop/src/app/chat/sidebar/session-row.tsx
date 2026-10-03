@@ -209,7 +209,7 @@ function SidebarSessionRowImpl({
   if (isDefaultProfile || showProfile || pinnedProfile) {
     trailing.push({
       key: 'profile',
-      node: <ProfileTag connectionId={session.connection_id} profile={session.profile} />
+      node: <ProfileTag profile={session.profile} />
     })
   }
 

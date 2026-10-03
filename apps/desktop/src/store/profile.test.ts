@@ -8,7 +8,6 @@ import type { ProfileInfo } from '@/types/hermes'
 // the REST query client must not run for real in a unit test.
 const ensureGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const ensureGatewayForAgent = vi.fn(async (_connectionId: string, _profile: string) => undefined)
-const activeGatewayConnectionId = vi.fn<() => null | string>(() => null)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const openGatewayForAgent = vi.fn(async (_connectionId: null | string, _profile: string) => undefined)
 const openSecondaryCount = vi.fn(() => 0)
@@ -22,7 +21,6 @@ vi.mock('@/store/gateway', () => ({
   activeGatewayConnectionId,
   // Activation now verifies the socket's route before publishing the profile.
   activeGatewayProfileKey: () => ensureGatewayForProfile.mock.lastCall?.[0] ?? $activeGatewayProfile.get(),
-  activeGatewayConnectionId,
   ensureGatewayForAgent,
   ensureGatewayForProfile,
   openGatewayForAgent,

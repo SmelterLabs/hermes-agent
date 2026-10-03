@@ -92,6 +92,8 @@ vi.mock('@/i18n', () => ({
           noColor: 'No color'
         },
         row: {
+          // Local overlay tags default-profile rows too, so the tag's label is read here.
+          ownedByProfile: (profile: string) => `Profile: ${profile}`,
           ageMin: 'm',
           ageNow: 'now',
           archive: 'Archive',

@@ -498,6 +498,8 @@ describe('ChatSidebar messaging owners', () => {
 
     expect(telegramGroups()).toHaveLength(0)
     expect(screen.queryByText('work-1')).toBeNull()
-    expect(within(row('default-1')).queryByRole('img', { name: /^Profile:/ })).toBeNull()
+    // Local overlay: the default profile is the machine owner and keeps its tag
+    // on every row it owns, even when the sidebar is scoped to that one profile.
+    expect(within(row('default-1')).getByRole('img', { name: 'Profile: default' })).toBeTruthy()
   })
 })
