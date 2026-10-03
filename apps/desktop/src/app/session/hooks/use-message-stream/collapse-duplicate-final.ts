@@ -146,3 +146,101 @@ export function collapseDuplicateFinalOntoIdenticalInterim(
 
   return mergeLiveIntoKept(messages, streamIndex, interimIndex, options.completeMessage)
 }
+
+/** A replayed stream may finish after its durable turn was already hydrated. */
+export function collapseDuplicateFinalIntoDurable(
+  messages: ChatMessage[],
+  streamIndex: number,
+  options: Pick<
+    Parameters<typeof collapseDuplicateFinalAfterToolInterim>[2],
+    'completeMessage' | 'finalText' | 'hasFailure'
+  >
+): DuplicateFinalCollapse | null {
+  const live = messages[streamIndex]
+
+  if (streamIndex < 0 || options.hasFailure || !options.finalText || live?.role !== 'assistant') {
+    return null
+  }
+
+  const liveTools = live.parts.filter(part => part.type === 'tool-call')
+
+  if (
+    !liveTools.length ||
+    liveTools.some(part => !part.toolCallId) ||
+    chatMessageText(live).trim() !== options.finalText
+  ) {
+    return null
+  }
+
+  const promptIndex = messages.findLastIndex((message, index) => index < streamIndex && message.role === 'user')
+
+  if (promptIndex < 0) {
+    return null
+  }
+
+  const settled = options.completeMessage(live)
+
+  const savedIndex = messages.findLastIndex((message, index) => {
+    if (
+      index <= promptIndex ||
+      index >= streamIndex ||
+      message.role !== 'assistant' ||
+      message.rowId === undefined ||
+      message.durableComplete !== true ||
+      message.pending ||
+      message.interim ||
+      message.hidden ||
+      message.error ||
+      chatMessageText(message).trim() !== options.finalText
+    ) {
+      return false
+    }
+
+    if (settled.rowId !== undefined && settled.rowId !== message.rowId) {
+      return false
+    }
+
+    const savedTools = new Set(message.parts.flatMap(part => (part.type === 'tool-call' ? [part.toolCallId] : [])))
+
+    const reasoningCovered = live.parts.every(
+      part =>
+        part.type !== 'reasoning' ||
+        message.parts.some(saved => saved.type === 'reasoning' && saved.text.trim() === part.text.trim())
+    )
+
+    return reasoningCovered && liveTools.every(part => savedTools.has(part.toolCallId))
+  })
+
+  if (savedIndex < 0) {
+    return null
+  }
+
+  const saved = messages[savedIndex]
+  const next = messages.slice()
+  next[savedIndex] = {
+    ...saved,
+    ...(settled.durationS !== undefined ? { durationS: settled.durationS } : {}),
+    ...(settled.completedAt !== undefined ? { completedAt: settled.completedAt } : {}),
+    parts: saved.parts.map(part => {
+      if (part.type !== 'tool-call') {
+        return part
+      }
+
+      const streamed = settled.parts.find(
+        candidate => candidate.type === 'tool-call' && candidate.toolCallId === part.toolCallId
+      )
+
+      return streamed
+        ? {
+            ...part,
+            ...(streamed.timestamp !== undefined ? { timestamp: streamed.timestamp } : {}),
+            ...(streamed.completedAt !== undefined ? { completedAt: streamed.completedAt } : {}),
+            ...(streamed.toolResultMetadata ? { toolResultMetadata: streamed.toolResultMetadata } : {})
+          }
+        : part
+    })
+  }
+  next.splice(streamIndex, 1)
+
+  return { keptId: saved.id, messages: next }
+}

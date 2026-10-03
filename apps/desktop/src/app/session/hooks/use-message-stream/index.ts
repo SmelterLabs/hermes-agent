@@ -41,6 +41,7 @@ import type { ClientSessionState } from '../../../types'
 
 import {
   collapseDuplicateFinalAfterToolInterim,
+  collapseDuplicateFinalIntoDurable,
   collapseDuplicateFinalOntoIdenticalInterim,
   type DuplicateFinalCollapse,
   identicalInterimSiblingIndex
@@ -894,11 +895,20 @@ export function useMessageStream({
         })
 
         if (streamIndex >= 0) {
+          const completionOptions = {
+            completeMessage,
+            finalText,
+            hasFailure
+          }
+
+          // Three independent de-duplication strategies, local first: fold a
+          // replayed completion into its already-loaded durable twin (overlay),
+          // then upstream's tool-interim fold, then upstream's identical sealed
+          // interim (#123801).
           collapsed =
+            collapseDuplicateFinalIntoDurable(prev, streamIndex, completionOptions) ??
             collapseDuplicateFinalAfterToolInterim(prev, streamIndex, {
-              completeMessage,
-              finalText,
-              hasFailure,
+              ...completionOptions,
               interimBoundaryPending
             }) ??
             collapseDuplicateFinalOntoIdenticalInterim(prev, streamIndex, identicalInterimIndex, {
