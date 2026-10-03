@@ -180,6 +180,12 @@ export function collapseDuplicateFinalIntoDurable(
 
   const settled = options.completeMessage(live)
 
+  // A saved fold can hold several segments of one tool turn; its answer is the last text part.
+  const textsOf = (message: ChatMessage) =>
+    message.parts.flatMap(part => (part.type === 'text' && part.text.trim() ? [part.text.trim()] : []))
+
+  const lastText = (message: ChatMessage) => textsOf(message).at(-1) ?? ''
+
   const savedIndex = messages.findLastIndex((message, index) => {
     if (
       index <= promptIndex ||
@@ -191,7 +197,7 @@ export function collapseDuplicateFinalIntoDurable(
       message.interim ||
       message.hidden ||
       message.error ||
-      chatMessageText(message).trim() !== options.finalText
+      lastText(message) !== options.finalText
     ) {
       return false
     }
@@ -216,6 +222,32 @@ export function collapseDuplicateFinalIntoDurable(
   }
 
   const saved = messages[savedIndex]
+  const savedTools = new Set(saved.parts.flatMap(part => (part.type === 'tool-call' ? [part.toolCallId] : [])))
+  const savedTexts = new Set(textsOf(saved))
+
+  // Earlier sealed live segments of this same turn that the saved fold already
+  // holds verbatim (every tool id and every text part). Anything it does not
+  // fully cover stays.
+  const coveredSegments = new Set(
+    messages.flatMap((message, index) => {
+      const tools = message.parts.flatMap(part => (part.type === 'tool-call' ? [part.toolCallId] : []))
+
+      return index > savedIndex &&
+        index < streamIndex &&
+        message.role === 'assistant' &&
+        message.rowId === undefined &&
+        message.pending !== true &&
+        !message.error &&
+        (message.interim === true || message.id.startsWith('assistant-stream-')) &&
+        tools.length > 0 &&
+        tools.every(id => id && savedTools.has(id)) &&
+        textsOf(message).every(text => savedTexts.has(text))
+        ? [index]
+        : []
+    })
+  )
+
+  const liveParts = [...coveredSegments].flatMap(index => messages[index].parts).concat(settled.parts)
   const next = messages.slice()
   next[savedIndex] = {
     ...saved,
@@ -226,7 +258,7 @@ export function collapseDuplicateFinalIntoDurable(
         return part
       }
 
-      const streamed = settled.parts.find(
+      const streamed = liveParts.find(
         candidate => candidate.type === 'tool-call' && candidate.toolCallId === part.toolCallId
       )
 
@@ -240,7 +272,9 @@ export function collapseDuplicateFinalIntoDurable(
         : part
     })
   }
-  next.splice(streamIndex, 1)
 
-  return { keptId: saved.id, messages: next }
+  return {
+    keptId: saved.id,
+    messages: next.filter((_, index) => index !== streamIndex && !coveredSegments.has(index))
+  }
 }
