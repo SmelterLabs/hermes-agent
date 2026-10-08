@@ -2047,7 +2047,6 @@ class TestApiRunLeaseFinalRework:
                 description="dangerous command",
                 pattern_key="dangerous_command",
                 pattern_keys=["dangerous_command"],
-                warnings=[("dangerous_command", None, False)],
                 session_key=session_key,
                 approval_callback=None,
                 is_cli=True,
