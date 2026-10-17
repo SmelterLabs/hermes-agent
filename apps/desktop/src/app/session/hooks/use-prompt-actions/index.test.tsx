@@ -27,7 +27,6 @@ import {
   $messages,
   $sessions,
   $terminalBackend,
-  $turnStartedAt,
   setActiveSessionId,
   setCurrentUsage,
   setMessages,

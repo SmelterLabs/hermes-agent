@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 import { I18nProvider } from '@/i18n'
-import { $notifications, clearNotifications, notify, notifyError, setToastMessagesEnabled } from '@/store/notifications'
+import { clearNotifications, notify, setToastMessagesEnabled } from '@/store/notifications'
 import { stubResizeObserver } from '@/test/jsdom'
 
 import { NotificationStack } from './notifications'

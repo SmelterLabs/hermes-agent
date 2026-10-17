@@ -14430,53 +14430,6 @@ function recordWindowConnectionRoute(sender: Electron.WebContents, route: unknow
 
 ipcMain.on('hermes:connection:active-route', (event, route) => recordWindowConnectionRoute(event.sender, route))
 
-// An apparently open renderer socket can still target a remote dashboard that
-// exited. Probe the exact registry profile before activation; `rebuilt` tells
-// the renderer to close that stale socket and redial the descriptor recovered
-// by the newer dispatch-time liveness path.
-ipcMain.handle('hermes:connection:revalidate-for', async (_event, payload) => {
-  const { connectionId, profile } = payload && typeof payload === 'object' ? (payload as any) : ({} as any)
-  const registry = readDesktopConnectionsRegistry()
-  const id = String(connectionId || '').trim() || registry.primary
-  let key = backendScopeKey(id, profile)
-  const source = registry.connections.find(connection => connection.id === id)
-
-  if (
-    source?.kind === 'local' &&
-    resolveRegistryLocalRoute(connectionScopeKey(profile), {
-      globalRemote: globalRemoteActive(),
-      profileRemoteOverride: Boolean(profileHasRemoteOverride(connectionScopeKey(profile)))
-    }).delegate
-  ) {
-    // ensureRegistryBackend delegates these routes to ensureBackend: shared
-    // profiles have NO pool entry; isolated/override routes use the bare key.
-    // Missing a composite entry is therefore not proof of a stale generation.
-    const connection = await ensureRegistryBackend(id, profile)
-
-    if (connection.sharedPrimary || connectionScopeKey(profile) === primaryProfileKey()) {
-      return { ok: true, rebuilt: false }
-    }
-
-    key = connectionScopeKey(profile)
-  }
-
-  const entry = backendPool.get(key)
-
-  // An open renderer socket with no matching main-process generation is stale
-  // by definition: dispatch recovery already retired or replaced its backend.
-  if (!source || !entry?.connectionPromise) {
-    return { ok: true, rebuilt: true }
-  }
-
-  if (entry.process || !entry.remoteBaseUrl) {
-    return { ok: true, rebuilt: backendPool.get(key) !== entry }
-  }
-
-  const validated = await validateRegistryPooledBackend(key, id, profile, source, entry)
-
-  return { ok: true, rebuilt: validated.rebuilt || backendPool.get(key) !== entry }
-})
-
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
 // so the 'exit'/'error' handlers that would clear a dead connection promise never
 // fire — once the remote becomes unreachable across a sleep/wake the renderer
