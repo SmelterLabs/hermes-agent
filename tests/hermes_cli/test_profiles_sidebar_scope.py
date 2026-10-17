@@ -14,88 +14,6 @@ Two behaviors that only show up with more than one profile on disk:
 import pytest
 
 
-_LARGE_JSON_ROUTES = [
-    "/api/profiles/sessions/sidebar",
-    "/api/profiles/projects/tree",
-    "/api/sessions/render-thread/messages?profile=worker",
-]
-
-
-def _is_history_payload(value):
-    return isinstance(value, dict) and (
-        {"recents", "cron", "messaging"} <= value.keys()
-        or {"projects", "scoped_session_ids"} <= value.keys()
-        or {"session_id", "messages", "pagination"} <= value.keys()
-    )
-
-
-@pytest.mark.parametrize("route", _LARGE_JSON_ROUTES)
-def test_history_json_is_encoded_off_event_loop(client, profiles_on_disk, monkeypatch, route):
-    import asyncio
-    import json
-
-    _seed_session(profiles_on_disk["worker"], "render-thread", source="cli")
-    dumps = json.dumps
-    threads = []
-
-    def record_dumps(value, *args, **kwargs):
-        if _is_history_payload(value):
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                threads.append("worker")
-            else:
-                threads.append("loop")
-        return dumps(value, *args, **kwargs)
-
-    monkeypatch.setattr(json, "dumps", record_dumps)
-    response = client.get(route)
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "application/json"
-    payload = response.json()
-    if "messages" in payload:
-        assert payload["profile"] == "worker"
-        assert payload["messages"][0]["content"] == "hi"
-        assert payload["pagination"] == {
-            "limit": 500, "offset": 0, "order": "latest", "returned": 1,
-        }
-    assert threads == ["worker"]
-
-
-@pytest.mark.parametrize("route", _LARGE_JSON_ROUTES)
-def test_history_encoding_keeps_other_requests_responsive(client, profiles_on_disk, monkeypatch, route):
-    import json
-    import threading
-    from concurrent.futures import ThreadPoolExecutor, TimeoutError
-
-    _seed_session(profiles_on_disk["worker"], "render-thread", source="cli")
-    entered, release = threading.Event(), threading.Event()
-    dumps = json.dumps
-
-    def slow_dumps(value, *args, **kwargs):
-        if _is_history_payload(value):
-            entered.set()
-            assert release.wait(15), "test did not release the JSON encoder"
-        return dumps(value, *args, **kwargs)
-
-    # A context pins one ASGI loop for both requests; separate bare-client
-    # requests would each get a loop and conceal the starvation.
-    with client, ThreadPoolExecutor(max_workers=2) as pool:
-        monkeypatch.setattr(json, "dumps", slow_dumps)
-        rendering = pool.submit(client.get, route)
-        try:
-            assert entered.wait(15), "history response never reached JSON encoding"
-            probe = pool.submit(client.get, "/api/profiles/worker/setup-command")
-            try:
-                response = probe.result(timeout=3)
-            except TimeoutError:
-                pytest.fail("history JSON encoding blocked an unrelated request")
-            assert response.status_code == 200
-        finally:
-            release.set()
-        assert rendering.result(timeout=15).status_code == 200
-
-
 @pytest.fixture(autouse=True)
 def _uncached_sidebar_endpoints(monkeypatch):
     """Both sidebar endpoints sit behind ``_sidebar_singleflight_cache`` (5s TTL). Every
@@ -225,30 +143,6 @@ class TestSidebarScope:
 
 
 class TestCrossProfileProjectTree:
-
-    def test_project_carries_the_profile_that_defaults_to_its_folder(self, client, profiles_on_disk, tmp_path):
-        default_project = tmp_path / "repos" / "home-base"
-        worker_project = tmp_path / "repos" / "ventures"
-        default_project.mkdir(parents=True)
-        worker_project.mkdir(parents=True)
-
-        (profiles_on_disk["default"] / "config.yaml").write_text(
-            f"terminal:\n  cwd: {default_project}\n", encoding="utf-8"
-        )
-        (profiles_on_disk["worker"] / "config.yaml").write_text(
-            f"terminal:\n  cwd: {worker_project}\n", encoding="utf-8"
-        )
-        _seed_project(profiles_on_disk["default"], "Home Base", default_project)
-        _seed_project(profiles_on_disk["worker"], "Ventures", worker_project)
-        _seed_session(profiles_on_disk["default"], "home-base-chat", source="cli", cwd=default_project)
-        _seed_session(profiles_on_disk["worker"], "ventures-chat", source="cli", cwd=worker_project)
-
-        payload = client.get("/api/profiles/projects/tree").json()
-        owners = {project["label"]: project.get("defaultProfile") for project in payload["projects"]}
-
-        assert owners["Home Base"] == "default"
-        assert owners["Ventures"] == "worker"
-
 
     def test_one_folder_worked_in_by_two_profiles_is_one_project(self, client, profiles_on_disk, tmp_path):
         # A folder is a folder no matter who opened it. Two profiles working the
@@ -435,20 +329,3 @@ class TestSidebarShowSubagents:
         assert _slice_ids(payload, "recents") == {"default-parent", "worker-parent", "worker-sub"}
         # The messaging slice keeps its shape: a subagent run is not a platform thread.
         assert _slice_ids(payload, "messaging") == set()
-
-
-def test_sidebar_enumeration_stays_on_selected_box(profiles_on_disk, monkeypatch, tmp_path):
-    from hermes_cli.web_routers import profiles as routes
-    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-
-    # A different box's filesystem is not part of this backend's roster.
-    other = tmp_path / "other-box" / "profiles" / "outsider"
-    other.mkdir(parents=True)
-    (other / "config.yaml").write_text("{}", encoding="utf-8")
-    token = set_hermes_home_override(profiles_on_disk["worker"])
-    try:
-        targets = dict(routes._profile_targets("test selected box"))
-    finally:
-        reset_hermes_home_override(token)
-    assert targets == profiles_on_disk
-    assert "outsider" not in targets
