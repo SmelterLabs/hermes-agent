@@ -252,11 +252,14 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             require_capability=require_api_server_capability,
         ):
             return _notify_failed()
-        adopted = _await_coalesced_leader(
-            session_key, leader, payload,
-            api_server_capability=api_server_capability,
-            require_api_server_capability=require_api_server_capability,
-        )
+        if validate_registration:
+            adopted = _await_coalesced_leader(
+                session_key, leader, payload,
+                api_server_capability=api_server_capability,
+                require_api_server_capability=require_api_server_capability,
+            )
+        else:
+            adopted = _await_coalesced_leader(session_key, leader, payload)
         if adopted is not None:
             return adopted
 
