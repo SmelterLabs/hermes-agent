@@ -843,9 +843,6 @@ def _session_has_active_delegations(sid: str, session: dict | None = None) -> bo
 # One pending WS-orphan reap Timer per live sid; guarded by _sessions_lock. Cancelled by _cancel_ws_orphan_reap from
 # every resume/reuse/transport-rebind path — else a reap on a reattached session triggers a reap->broadcast->resume storm.
 _pending_ws_reaps: dict[str, threading.Timer] = {}
-# Legacy/opaque agents have no activity clock. Preserve their running work for
-# four hours; modern inline and isolated turns use the upstream activity clock.
-_WS_ORPHAN_RUNNING_TURN_MAX_S = 4 * 3600.0
 
 
 def _cancel_ws_orphan_reap(sid: str) -> None:
@@ -853,8 +850,6 @@ def _cancel_ws_orphan_reap(sid: str) -> None:
     transport; closes the fired-but-not-run Timer race and stops dead Timers accumulating on flappy clients."""
     with _sessions_lock:
         timer = _pending_ws_reaps.pop(sid, None)
-        if (current := _sessions.get(sid)) is not None:
-            current.pop("_client_gone_running_deadline", None)
     if timer is not None:
         with contextlib.suppress(Exception):
             timer.cancel()
@@ -992,13 +987,6 @@ def _schedule_ws_orphan_reap(
                 logger.debug("client_gone sid=%s action=defer (turn activity fresh; stale threshold %.0fs)",
                              sid, _WS_ORPHAN_ACTIVITY_STALE_S)
                 reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
-            elif (not current.get("_client_gone_interrupt_requested")
-                  and not current.get("_compute_host_turn_id")
-                  and not callable(getattr(current.get("agent"), "get_activity_summary", None))
-                  and time.time() < current.setdefault(
-                      "_client_gone_running_deadline", time.time() + _WS_ORPHAN_RUNNING_TURN_MAX_S)):
-                # Do not override a stale modern clock with the legacy allowance.
-                reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
             else:
                 # Mid-turn detached sessions must never drop the single Timer: interrupt once after grace, then poll
                 # until turn-finalization settles.
@@ -1096,7 +1084,6 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
                     current["transport"] = _detached_ws_transport
                     current.pop("_client_gone_interrupt_requested", None)
                     current.pop("_client_gone_interrupt_polls", None)
-                    current.pop("_client_gone_running_deadline", None)
                     should_schedule_reap = True
                     # Register before releasing the detachment claim: an old disconnect
                     # must not arm its first timer over a reconnect's newer detachment.
