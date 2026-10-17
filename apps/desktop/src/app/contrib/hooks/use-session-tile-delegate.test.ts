@@ -269,12 +269,20 @@ describe('useSessionTileDelegate resumeTile', () => {
 
     await sessionTileDelegate()!.resumeTile('stored-tile', { authoritativeSnapshot: true })
 
-    expect(requestGatewayForAgent).toHaveBeenCalledWith('remote-tile', 'tile-profile', 'session.resume', {
-      cols: 96,
-      omit_messages: false,
-      profile: 'backend-tile',
-      session_id: 'stored-tile'
-    })
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'remote-tile',
+      'tile-profile',
+      'session.resume',
+      {
+        cols: 96,
+        omit_messages: false,
+        profile: 'backend-tile',
+        session_id: 'stored-tile'
+      },
+      // carried: cold resumes get the long ack budget
+      SESSION_RESUME_REQUEST_TIMEOUT_MS,
+      undefined
+    )
     expect(getLatestSessionMessages).not.toHaveBeenCalled()
     expect(states.current.get('runtime-tile')).toMatchObject({ busy: true, model: 'snapshot-model' })
     expect(JSON.stringify(states.current.get('runtime-tile')?.messages)).toContain('new answer')

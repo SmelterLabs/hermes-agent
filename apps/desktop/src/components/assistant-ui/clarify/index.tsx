@@ -38,14 +38,6 @@ function ClarifyToolLive(props: ToolCallMessagePartProps) {
   const $request = useMemo(() => sessionClarifyRequest(sessionId), [sessionId])
   const request = useStore($request)
   const fromArgs = useMemo(() => readClarifyArgs(props.args), [props.args])
-  // Old transcript rows must never adopt a newer question from the same session.
-  const matchingRequest =
-    request &&
-    request.questions.length === (fromArgs.questions?.length ?? 0) &&
-    request.questions.every((question, index) => question.question.trim() === fromArgs.questions?.[index]?.question.trim())
-      ? request
-      : null
-
   const messageRunning = useAuiState(selectMessageRunning)
   const messageId = useAuiState(s => s.message.id)
   const rowKey = `${sessionId ?? ''}:${messageId}:${props.toolCallId}`
@@ -57,11 +49,11 @@ function ClarifyToolLive(props: ToolCallMessagePartProps) {
   const requestId = requestIdByToolCall.get(rowKey)
   const settledResult = requestId && request?.requestId !== requestId ? settledResults[requestId] : undefined
 
-  if (matchingRequest && !settledResult && matchingRequest.requestId !== requestId) {
-    requestIdByToolCall.set(rowKey, matchingRequest.requestId)
+  if (request && !settledResult && request.requestId !== requestId) {
+    requestIdByToolCall.set(rowKey, request.requestId)
   }
 
-  const undelivered = useUndeliveredClarify(sessionId, messageRunning && !matchingRequest && !answered && !settledResult)
+  const undelivered = useUndeliveredClarify(sessionId, messageRunning && !request && !answered && !settledResult)
 
   if (settledResult) {
     return <ClarifyToolSettled {...props} result={settledResult} />
@@ -71,16 +63,15 @@ function ClarifyToolLive(props: ToolCallMessagePartProps) {
   // `session.info` reports running=false while clarify is blocking, so the
   // running flag alone would remount the question as a tool row. Keep the
   // card while a request is open or this instance already submitted.
-  if (!messageRunning && !matchingRequest && !answered) {
+  if (!messageRunning && !request && !answered) {
     return <ToolFallback {...props} />
   }
 
   return (
     <ClarifyToolPending
       fromArgs={fromArgs}
-      key={matchingRequest ? `${matchingRequest.sessionId}\0${matchingRequest.requestId}` : 'preview'}
       onAnswered={() => setAnswered(true)}
-      request={matchingRequest}
+      request={request}
       undelivered={undelivered}
     />
   )

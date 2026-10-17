@@ -304,7 +304,11 @@ describe('submit timeout admission fences', () => {
     await actRender(<Harness onReady={h => (handle = h)} rawAdmissionReceipts refreshSessions={async () => undefined} requestGateway={requestGateway} />)
     expect(await handle!.submitText('safe identified retry', { submission_id: 'identified-timeout' })).toBe(true)
     expect(submits.map(p => p.submission_id)).toEqual(['identified-timeout', 'identified-timeout'])
-    expect(requestGateway).toHaveBeenCalledWith('session.resume', expect.objectContaining({ session_id: RUNTIME_SESSION_ID }))
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.resume',
+      expect.objectContaining({ session_id: RUNTIME_SESSION_ID }),
+      SESSION_RESUME_REQUEST_TIMEOUT_MS
+    )
   })
 })
 
@@ -2454,7 +2458,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect($activeSessionId.get()).toBe('rt-recovered')
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      { session_id: 'rt-recovered', text: 'ask the user a question' },
+      expect.objectContaining({ session_id: 'rt-recovered', text: 'ask the user a question' }),
       1_800_000
     )
   })
