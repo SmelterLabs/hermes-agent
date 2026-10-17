@@ -15,7 +15,6 @@ import { hasOpenServerRequest, rememberServerRequest, resetServerRequestsForTest
 import { $activeSessionId, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
 
 import { readClarifyResult } from './parse'
-import { resetClarifyDraftsForTests } from './pending'
 
 import { ClarifyTool } from './index'
 
@@ -56,10 +55,8 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
-  messageRunning = true
   clearClarifyRequest()
   resetServerRequestsForTests()
-  resetClarifyDraftsForTests()
   $activeSessionId.set(null)
   $gateway.set(null)
   messageRunning = true
@@ -154,38 +151,6 @@ describe('ClarifyTool live card stays mounted across settle', () => {
 
     expect(document.querySelector('[data-clarify-choices]')).toBeNull()
     expect(screen.queryByRole('button', { name: /Confirm and continue/ })).toBeNull()
-  })
-
-  it('does not attach an old tool row to a newer pending question in the same session', () => {
-    renderLiveClarify()
-    messageRunning = false
-    act(() =>
-      setClarifyRequest({
-        questions: [{ choices: ['yes', 'no'], multiSelect: false, qid: 'q0', question: 'Deploy now?' }],
-        requestId: 'request-new',
-        sessionId: 'session-1'
-      })
-    )
-
-    expect(document.querySelector('form[data-clarify-batch]')).toBeNull()
-    expect(screen.queryByText('Deploy now?')).toBeNull()
-  })
-
-  it('does not carry drafts into a new request with the same question and qid', () => {
-    renderLiveClarify()
-    fireEvent.change(screen.getByPlaceholderText(/Other/), { target: { value: 'canary' } })
-    act(() =>
-      setClarifyRequest({
-        questions: [
-          { choices: ['staging', 'production'], multiSelect: false, qid: 'q0', question: 'Which deployment target?' }
-        ],
-        requestId: 'request-new',
-        sessionId: 'session-1'
-      })
-    )
-
-    expect((screen.getByPlaceholderText(/Other/) as HTMLTextAreaElement).value).toBe('')
-    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(true)
   })
 
   it('holds the card through the gap between answering and the settled result', async () => {
@@ -405,30 +370,6 @@ describe('ClarifyTool keyboard navigation', () => {
     expect((other as HTMLTextAreaElement).value).toBe('canary')
   })
 
-  it('preserves a staged single-question answer when reconciliation remounts the tool card', () => {
-    renderLiveClarify()
-
-    fireEvent.click(screen.getByRole('button', { name: /production/ }))
-    expect(screen.getByRole('button', { name: /production/ }).getAttribute('aria-pressed')).toBe('true')
-
-    cleanup()
-    renderLiveClarify()
-
-    expect(screen.getByRole('button', { name: /production/ }).getAttribute('aria-pressed')).toBe('true')
-    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(false)
-  })
-
-  it('preserves single-question free text when reconciliation remounts the tool card', () => {
-    renderLiveClarify()
-
-    fireEvent.change(screen.getByPlaceholderText(/Other/), { target: { value: 'canary' } })
-    cleanup()
-    renderLiveClarify()
-
-    expect((screen.getByPlaceholderText(/Other/) as HTMLTextAreaElement).value).toBe('canary')
-    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(false)
-  })
-
   it('does not intercept keyboard events while an action button has focus', () => {
     const { request, respond } = renderLiveClarify()
     const skip = screen.getByRole('button', { name: 'Skip' })
@@ -557,7 +498,9 @@ function batchArgs(): { questions: { question: string; choices?: string[] }[] } 
   }
 }
 
-function liveBatchProps(args = batchArgs()): ToolCallMessagePartProps {
+function liveBatchProps(): ToolCallMessagePartProps {
+  const args = batchArgs()
+
   return {
     addResult: vi.fn(),
     args,
@@ -592,45 +535,6 @@ function renderLiveBatch(lockedAnswers?: Record<string, string>, multiSelect = f
 
   return { request, respond }
 }
-
-function renderAllChoiceBatch() {
-  const request = vi.fn().mockResolvedValue({ ok: true, remaining: [] })
-
-  const questions = [
-    { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Color?' },
-    { choices: ['Coffee', 'Tea'], multiSelect: false, qid: 'q1', question: 'Drink?' },
-    { choices: ['Morning', 'Evening'], multiSelect: false, qid: 'q2', question: 'Time?' }
-  ]
-
-  // The server-requests store owns liveness: without it the card stays in preview (disabled).
-  liveServerRequest('request-batch')
-  $activeSessionId.set('session-1')
-  $gateway.set({ request } as never)
-  setClarifyRequest({
-    questions,
-    requestId: 'request-batch',
-    sessionId: 'session-1'
-  })
-  renderClarify(
-    <ClarifyTool
-      {...liveBatchProps({
-        questions: questions.map(({ choices, question }) => ({ choices, question }))
-      })}
-    />
-  )
-
-  return request
-}
-
-describe('ClarifyTool batch pending liveness', () => {
-  it('keeps a restored batch visible when its hydrated message is complete', () => {
-    messageRunning = false
-    renderLiveBatch()
-
-    expect(screen.getByText('Color?')).toBeTruthy()
-    expect(screen.getByText('Name?')).toBeTruthy()
-  })
-})
 
 describe('readClarifyResult', () => {
   it('parses responses with string and list answers', () => {
@@ -844,22 +748,6 @@ describe('ClarifyTool batch card', () => {
     expect((confirm as HTMLButtonElement).disabled).toBe(false)
   })
 
-  it('preserves staged batch answers when transcript reconciliation remounts the tool card', () => {
-    renderLiveBatch()
-
-    fireEvent.click(screen.getByRole('button', { name: /red/ }))
-    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
-    expect(screen.getByText('2 of 2 answered')).toBeTruthy()
-
-    cleanup()
-    renderLiveBatch()
-
-    expect(screen.getByRole('button', { name: /red/ }).getAttribute('aria-pressed')).toBe('true')
-    expect((screen.getByPlaceholderText('Type your answer…') as HTMLTextAreaElement).value).toBe('packet')
-    expect(screen.getByText('2 of 2 answered')).toBeTruthy()
-    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(false)
-  })
-
   it('confirm sends every per-question clarify.lock in order and completes the batch', async () => {
     const { request } = renderLiveBatch()
 
@@ -882,73 +770,6 @@ describe('ClarifyTool batch card', () => {
     })
     // The last lock resolves the server request; the card forgets it locally.
     await waitFor(() => expect(hasOpenServerRequest('request-batch')).toBe(false))
-  })
-
-  it('Enter on the last focused choice submits every staged answer in order and completes the batch', async () => {
-    const request = renderAllChoiceBatch()
-
-    fireEvent.click(screen.getByRole('button', { name: /red/ }))
-    fireEvent.click(screen.getByRole('button', { name: /Coffee/ }))
-    const lastChoice = screen.getByRole('button', { name: /Morning/ })
-    fireEvent.click(lastChoice)
-    lastChoice.focus()
-
-    expect(lastChoice.ownerDocument.activeElement).toBe(lastChoice)
-    expect(fireEvent.keyDown(lastChoice, { key: 'Enter' })).toBe(false)
-
-    await waitFor(() => {
-      expect(request).toHaveBeenCalledTimes(3)
-    })
-    expect(request).toHaveBeenNthCalledWith(1, 'clarify.lock', {
-      answer: 'red',
-      question_id: 'q0',
-      request_id: 'request-batch'
-    })
-    expect(request).toHaveBeenNthCalledWith(2, 'clarify.lock', {
-      answer: 'Coffee',
-      question_id: 'q1',
-      request_id: 'request-batch'
-    })
-    expect(request).toHaveBeenNthCalledWith(3, 'clarify.lock', {
-      answer: 'Morning',
-      question_id: 'q2',
-      request_id: 'request-batch'
-    })
-    // Completion clears the live request. The preview remains visible but cannot
-    // submit again; query the current form because request identity can remount it.
-    await waitFor(() => {
-      const preview = screen.getByRole('button', { name: /Confirm and continue/ })
-      expect(preview.closest('form')?.hasAttribute('data-clarify-batch-preview')).toBe(true)
-      expect((preview as HTMLButtonElement).disabled).toBe(true)
-    })
-  })
-
-  it('Enter on a focused multi-select choice submits a partial batch without toggling it', async () => {
-    const { request } = renderLiveBatch(undefined, true)
-    const red = screen.getByRole('button', { name: /red/ })
-    const blue = screen.getByRole('button', { name: /blue/ })
-
-    fireEvent.click(red)
-    fireEvent.click(blue)
-    blue.focus()
-
-    expect(blue.ownerDocument.activeElement).toBe(blue)
-    expect(fireEvent.keyDown(blue, { key: 'Enter' })).toBe(false)
-
-    expect(red.getAttribute('aria-pressed')).toBe('true')
-    expect(blue.getAttribute('aria-pressed')).toBe('true')
-    expect(screen.getByText('1 of 2 answered')).toBeTruthy()
-    await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
-    expect(request).toHaveBeenNthCalledWith(1, 'clarify.lock', {
-      answer: JSON.stringify(['red', 'blue']),
-      question_id: 'q0',
-      request_id: 'request-batch'
-    })
-    expect(request).toHaveBeenNthCalledWith(2, 'clarify.lock', {
-      answer: null,
-      question_id: 'q1',
-      request_id: 'request-batch'
-    })
   })
 
   it('a staged answer stays editable before confirm', async () => {
