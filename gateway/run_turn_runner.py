@@ -883,6 +883,29 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             logger.warning("Native image attachment failed, falling back to text: %s", exc)
         return ctx.message
 
+    def _attended_api_approval_lease(self, session_key):
+        """Server-issued approval lease for an ATTENDED canonical API turn, else ``(None, None)``.
+
+        Attended means: this turn executes an api_server admission (``api_execution`` is bound), it has
+        an owning session authority, and at least one API request is observing that exact admission —
+        the observer that projects ``approval.request`` to ``/v1/runs`` status/SSE and whose run id
+        answers through ``POST /v1/runs/{id}/approval``. A turn nobody observes stays unattended and
+        keeps ``approvals.unattended_mode`` (deny by default)."""
+        if not session_key or self._approval_owner is None:
+            return None, None
+        try:
+            from gateway.session_api_turn import _api_observers, api_execution
+            if api_execution.get() is None:
+                return None, None
+            authority, session_id, _generation = self._approval_owner
+            if not _api_observers(authority, session_id):
+                return None, None
+            from tools.approval import issue_api_run_approval_lease
+            return issue_api_run_approval_lease(session_key, owner=self), None
+        except Exception:
+            logger.debug("attended API approval lease unavailable", exc_info=True)
+            return None, None
+
     def _run_conversation_with_approval(self, agent, agent_history, observed_group_context,
                                         persist_user_message_override, persist_user_timestamp_override):
         """Run the turn with the per-session gateway approval callback registered: dangerous-command
@@ -893,7 +916,17 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         ctx = self._ctx
         session_key = ctx.session_key or ""
         token = set_current_session_key(session_key)
-        register_gateway_notify(session_key, self._approval_notify_sync)
+        api_lease, lease_token = self._attended_api_approval_lease(session_key)
+        if api_lease is not None:
+            # An attended canonical API turn (a /v1/runs or chat request is observing this exact
+            # admission): its prompts park in the session's pending controls and are answered via
+            # POST /v1/runs/{id}/approval, so the listener carries the server-issued lease that
+            # marks an api_server context as able to ask a human.
+            from tools.approval_context import set_current_api_server_run_lease
+            register_gateway_notify(session_key, self._approval_notify_sync, capability=api_lease)
+            lease_token = set_current_api_server_run_lease(api_lease)
+        else:
+            register_gateway_notify(session_key, self._approval_notify_sync)
         try:
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
@@ -942,7 +975,18 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 _settle_api_runtime_lock(agent, result, captured)
             return result
         finally:
-            unregister_gateway_notify(session_key)
+            if api_lease is not None:
+                from tools.approval import revoke_api_run_approval_lease
+                from tools.approval_context import reset_current_api_server_run_lease
+                with suppress(Exception):
+                    unregister_gateway_notify(session_key, capability=api_lease)
+                with suppress(Exception):
+                    revoke_api_run_approval_lease(api_lease)
+                if lease_token is not None:
+                    with suppress(Exception):
+                        reset_current_api_server_run_lease(lease_token)
+            else:
+                unregister_gateway_notify(session_key)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
             # run (interrupt, completion, gateway shutdown). Idempotent.
             with suppress(Exception):
