@@ -1140,8 +1140,12 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             def _control_cb(event_type, prompt):
                 # Same authority prompt the WS viewer and GET pending_controls expose, on the
                 # run's own stream so a streaming-only client learns it must respond.
+                # Run-API clients correlate by ``request_id`` (the legacy run contract); the
+                # authority prompt names it ``prompt_id``. Carry both, never invent one.
+                fields = {**prompt, **({'request_id': prompt['prompt_id']}
+                                       if prompt.get('prompt_id') and 'request_id' not in prompt else {})}
                 with suppress(Exception):
-                    loop.call_soon_threadsafe(run.put_event, _run_event(run_id, event_type, **prompt))
+                    loop.call_soon_threadsafe(run.put_event, _run_event(run_id, event_type, **fields))
 
             def _tool_start(call_id, name, args):
                 from agent.display import build_tool_preview

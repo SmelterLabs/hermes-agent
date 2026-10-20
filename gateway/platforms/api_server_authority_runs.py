@@ -99,9 +99,14 @@ async def respond_run(adapter, run_id, body, *, kind):
     if owned is None:
         raise RuntimeStoreError('not_found')
     authority, row = owned
+    field = 'choice' if kind == 'approval' else 'answer'
+    if set(body) == {'request_id', field}:
+        # Run-scoped clients (the Clyde app) answer with the run-API shape {choice, request_id}.
+        # The run id is owner-authenticated and the prompt id is exact, so the fence is the run's
+        # CURRENT execution generation; a prompt from any other generation is still refused below.
+        body = {**body, 'execution_generation': row['generation']}
     generation = body.get('execution_generation')
     prompt_id = body.get('request_id')
-    field = 'choice' if kind == 'approval' else 'answer'
     if set(body) != {'request_id', 'execution_generation', field}:
         raise RuntimeStoreError('invalid_params')
     if row['status'] != 'started' or type(generation) is not int or generation != row['generation']:
