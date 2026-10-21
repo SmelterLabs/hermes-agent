@@ -177,14 +177,19 @@ def _home(authority, actor, profile):
     return home
 
 
-async def _target(authority, actor):
+async def _target(authority, actor, session_id=None):
+    """The Bot Chat's live local target, or — for an agent handoff — the named local session's.
+    A handoff never creates a chat: the session must already exist as the profile's own local chat."""
     ref = None
-    if authority.db.get_session_by_title('Bot Chat') is None:
+    if session_id is None and authority.db.get_session_by_title('Bot Chat') is None:
         ref = await _create_bot_chat(authority, actor)  # None: a concurrent delivery created it first
     if ref is None:
-        row = authority.db.get_session_by_title('Bot Chat')
-        tip = authority.db.get_compression_tip(row['id'])
-        target = authority.db.get_session(tip)
+        if session_id is None:
+            row = authority.db.get_session_by_title('Bot Chat')
+            tip = authority.db.get_compression_tip(row['id'])
+        else:
+            tip = authority.db.get_compression_tip(session_id)
+        target = authority.db.get_session(tip) if tip else None
         if target is None:
             raise RuntimeStoreError('not_found')
         from gateway.session_local_migration import resolve_local_target
@@ -586,8 +591,16 @@ def _require_same_delivery(record, actor, message, author, category):
 async def _deliver(connection, params):
     authority, actor = connection.authority, connection.actor
     home = _home(authority, actor, params.get('profile'))
-    if set(params) - {'id', 'profile', 'message', 'session_id', 'author', 'notification_category'}:
+    if set(params) - {'id', 'profile', 'message', 'session_id', 'author', 'notification_category', 'target_session'}:
         raise RuntimeStoreError('invalid_params')
+    # Agent handoff into a desktop chat other than the Bot Chat: the message must carry a bot
+    # author so the chat shows who sent it; it is never attributed to the owner.
+    handoff = params.get('target_session')
+    if handoff is not None:
+        bot = parse_turn_author(params.get('author'))
+        if not isinstance(handoff, str) or not handoff or bot is None or not bot.get('is_bot') \
+                or not str(bot.get('id') or '').startswith('bot:'):
+            raise RuntimeStoreError('handoff_author_required')
     from gateway.session_automation import automation_notification_metadata
     notification = automation_notification_metadata(params)
     category = notification.get('notification_category', 'result')
@@ -627,7 +640,7 @@ async def _deliver(connection, params):
                                            'message', 'reply', 'error', 'reason')}
         if record is not None:
             raise RuntimeStoreError('unknown_execution')
-        ref, live, entry = await _target(authority, actor)
+        ref, live, entry = await _target(authority, actor, session_id=handoff)
         if params.get('session_id', entry.session_id) != entry.session_id:
             raise RuntimeStoreError('admission_conflict')
         return await _admit(authority, actor, home, root, key, message, ref, live, entry, author=author,
