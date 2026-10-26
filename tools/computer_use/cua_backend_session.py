@@ -230,6 +230,9 @@ class _CuaDriverSession:
             (command, args), child_env = (
                 (daemon.proxy_invocation(), daemon.child_env()) if daemon is not None
                 else _cb.sandbox_mcp_invocation() or (_driver._resolve_mcp_invocation(driver_cmd), _cb.cua_driver_child_env()))
+            if daemon is None and driver_cmd and "--socket" not in args:
+                # Windows Session 0 (service): proxy to the interactive user's daemon over its named pipe.
+                args = [*args, *_driver.windows_session0_socket_args(command)]
             _t_manifest = _time.monotonic()
             # Telemetry policy first (default: disabled), then strip Hermes secrets.
             params = StdioServerParameters(command=command, args=args, env=_sanitize_subprocess_env(child_env))
@@ -457,6 +460,8 @@ class _CuaDriverSession:
         if daemon is not None:
             driver_command, child_env = daemon.proxy_invocation()[0], daemon.child_env()
             socket_args = ["--socket", daemon.socket_path]
+        else:
+            socket_args = _driver.windows_session0_socket_args(driver_command)
         cmd = [driver_command, "call", name, json.dumps(call_args), *socket_args]
         try:
             return _cli_result(_cli_run_json(cmd, _sanitize_subprocess_env(child_env), name, timeout), shot_file)

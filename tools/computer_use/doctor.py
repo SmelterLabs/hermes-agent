@@ -117,7 +117,8 @@ def _extract_health_report_from_result(result: Report) -> Report:
 
 def _open_mcp(binary: str) -> subprocess.Popen:
     """Spawn ``<binary> mcp``; pin UTF-8 — cua-driver emits emoji/arbitrary paths and Windows' cp1252 would raise."""
-    return subprocess.Popen([binary, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    from tools.computer_use.cua_backend_driver import windows_session0_socket_args
+    return subprocess.Popen([binary, "mcp", *windows_session0_socket_args(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, encoding="utf-8", errors="replace", bufsize=1, creationflags=windows_hide_flags(),
                             env=_sanitized_cua_env())
 

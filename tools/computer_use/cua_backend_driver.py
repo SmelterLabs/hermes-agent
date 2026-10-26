@@ -135,6 +135,37 @@ def _resolve_mcp_invocation(driver_cmd: str, *, timeout: float = 6.0) -> tuple[s
     command = command if command and _has_path_separator(command) else driver_cmd
     return command, _mcp_args_with_overlay_flag(args, driver_cmd=command)
 
+# The interactive user's `cua-driver serve` (autostart logon task) listens here; cua-driver's own default.
+_WINDOWS_SHARED_DAEMON_PIPE = r"\\.\pipe\cua-driver"
+
+@functools.lru_cache(maxsize=1)
+def _windows_session_id() -> Optional[int]:
+    """Windows session id of this process (0 = the non-interactive services session); None off Windows/on failure."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        sid = ctypes.c_ulong()
+        ok = ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(sid))
+        return int(sid.value) if ok else None
+    except Exception:
+        return None
+
+def windows_session0_socket_args(driver_cmd: str) -> list[str]:
+    """``["--socket", <pipe>]`` when Hermes runs in Windows Session 0 (e.g. inside a service), else ``[]``.
+
+    Session 0 has no desktop, so a bare ``cua-driver mcp`` refuses to start ("requires an interactive Windows
+    user session"). The interactive user's daemon is reachable from Session 0 over its named pipe, and
+    ``cua-driver mcp --socket <pipe>`` proxies to it. Raises a clear error when no such daemon is listening."""
+    if _windows_session_id() != 0:
+        return []
+    if _cb().cua_daemon_listening(driver_cmd, _WINDOWS_SHARED_DAEMON_PIPE) is False:
+        raise RuntimeError(
+            "Hermes is running in Windows Session 0 (a service), which has no desktop, and no interactive "
+            f"cua-driver daemon is listening on {_WINDOWS_SHARED_DAEMON_PIPE}. Start it in the signed-in user's "
+            "session (`cua-driver autostart enable` then `cua-driver autostart kick`), then retry.")
+    return ["--socket", _WINDOWS_SHARED_DAEMON_PIPE]
+
 def _manifest_contract_reason(manifest: Optional[dict[str, Any]]) -> str:
     """Why a parsed manifest fails the 0.20 contract, or ``""`` when it passes (version floor, MCP launch
     command, then the ``"<verb> <flag>"`` entries the advertised subcommands lack)."""
